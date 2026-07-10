@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "args.h"
+#include "changelog.h"
 #include "conn.h"
 #include "engine.h"
 
@@ -57,10 +58,11 @@ int main(int argc, char **argv) {
     }
 
     switch (args.mode) {
-    case MODE_VERSION:
+    case MODE_SELF_VERSION:
         printf("db2delta %s\n", DB2DELTA_VERSION);
         return 0;
 
+    case MODE_DB_VERSION:
     case MODE_EXEC:
     case MODE_APPLY: {
         /* Prompt for password interactively if not supplied */
@@ -78,8 +80,23 @@ int main(int argc, char **argv) {
         db2delta_conn_t conn;
         if (conn_open(&conn, &args) != 0) return 1;
 
-        int r2;
-        if (args.mode == MODE_EXEC) {
+        int r2 = 0;
+        if (args.mode == MODE_DB_VERSION) {
+            changelog_entry_t entry;
+            int rc = changelog_latest(&conn, &entry);
+            if (rc < 0) {
+                fprintf(stderr, "error: could not query changelog\n");
+                r2 = 1;
+            } else if (rc == 1) {
+                printf("no changesets applied yet\n");
+            } else if (args.script_mode) {
+                printf("%s\n", entry.changeset);
+            } else {
+                printf("changeset: %s\n", entry.changeset);
+                printf("file:      %s\n", entry.filename);
+                printf("applied:   %s\n", entry.applied_at);
+            }
+        } else if (args.mode == MODE_EXEC) {
             r2 = engine_query(&conn, args.query, args.script_mode);
         } else {
             engine_result_t res;

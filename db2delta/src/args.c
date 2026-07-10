@@ -48,11 +48,15 @@ void args_usage(const char *prog) {
         "Usage: %s <subcommand> [options]\n"
         "\n"
         "Subcommands:\n"
-        "  version                        Print db2delta version and exit\n"
-        "  exec   -d <dsn> -u <user> <SQL>         Execute SQL and print results\n"
-        "  apply  -d <dsn> -u <user> <file|dir>...  Apply delta files\n"
+        "  version  -d <dsn> -u <user>    Show latest applied delta from the database\n"
+        "  exec     -d <dsn> -u <user> <SQL>         Execute SQL and print results\n"
+        "  apply    -d <dsn> -u <user> <file|dir>...  Apply delta files\n"
+        "  help                           Show this help\n"
         "\n"
-        "Options (exec, apply):\n"
+        "Flags:\n"
+        "  -v                             Print db2delta tool version and exit\n"
+        "\n"
+        "Options (version, exec, apply):\n"
         "  -d, --database <host[:port]/db>  DB2 connection string (port defaults to 50000)\n"
         "  -u, --user <user>              DB2 username\n"
         "  -p, --password <password>      DB2 password (or set in database.env)\n"
@@ -63,7 +67,8 @@ void args_usage(const char *prog) {
         "CLI flags always override database.env.\n"
         "\n"
         "Examples:\n"
-        "  db2delta version\n"
+        "  db2delta -v\n"
+        "  db2delta version -d myhost/MYDB -u db2inst1\n"
         "  db2delta exec -d myhost/MYDB -u db2inst1 \"SELECT 1 FROM SYSIBM.SYSDUMMY1\"\n"
         "  db2delta apply -d myhost/MYDB -u db2inst1 changes/001_add_users.delta\n"
         "  db2delta apply -d myhost/MYDB -u db2inst1 -c migrations/\n",
@@ -80,7 +85,10 @@ int args_parse(int argc, char **argv, db2delta_args_t *out) {
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
 
-        if ((strcmp(a, "-d") == 0 || strcmp(a, "--database") == 0) && i + 1 < argc) {
+        if (strcmp(a, "-v") == 0) {
+            out->mode = MODE_SELF_VERSION;
+            return 0;   /* nothing else matters */
+        } else if ((strcmp(a, "-d") == 0 || strcmp(a, "--database") == 0) && i + 1 < argc) {
             if (args_parse_dsn(argv[++i], out) != 0) {
                 fprintf(stderr, "error: invalid DSN '%s'\n", argv[i]);
                 out->mode = MODE_USAGE;
@@ -104,7 +112,7 @@ int args_parse(int argc, char **argv, db2delta_args_t *out) {
             return -1;
         } else if (!subcmd_found) {
             subcmd_found = 1;
-            if      (strcmp(a, "version") == 0) out->mode = MODE_VERSION;
+            if      (strcmp(a, "version") == 0) out->mode = MODE_DB_VERSION;
             else if (strcmp(a, "exec")    == 0) out->mode = MODE_EXEC;
             else if (strcmp(a, "apply")   == 0) out->mode = MODE_APPLY;
             else if (strcmp(a, "help")    == 0) { /* leave MODE_USAGE */ }
@@ -127,7 +135,7 @@ int args_parse(int argc, char **argv, db2delta_args_t *out) {
 
     if (out->mode == MODE_USAGE) return 0;
 
-    if (out->mode == MODE_VERSION) return 0;
+    if (out->mode == MODE_SELF_VERSION) return 0;
 
     if (!have_dsn) {
         fprintf(stderr, "error: -d <dsn> is required\n");

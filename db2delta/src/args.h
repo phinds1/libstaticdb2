@@ -4,10 +4,11 @@
 #define DB2DELTA_MAX_FILES 256
 
 typedef enum {
-    MODE_USAGE   = 0,
-    MODE_VERSION,   /* version subcommand — print tool version, no DB needed */
-    MODE_EXEC,      /* exec subcommand — execute arbitrary SQL */
-    MODE_APPLY      /* apply subcommand — apply delta files */
+    MODE_USAGE        = 0,
+    MODE_SELF_VERSION,  /* -v flag — print tool version, no DB needed */
+    MODE_DB_VERSION,    /* version subcommand — query changelog for latest applied delta */
+    MODE_EXEC,          /* exec subcommand — execute arbitrary SQL */
+    MODE_APPLY          /* apply subcommand — apply delta files */
 } db2delta_mode_t;
 
 typedef struct {

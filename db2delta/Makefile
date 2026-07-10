@@ -1,10 +1,22 @@
 CC      = musl-gcc
-CFLAGS  = -std=c11 -Wall -Wextra -I ../include -I src -static \
-          -DDB2DELTA_VERSION=\"$(shell cat version)\"
 LDFLAGS = ../target/libstaticdb2.a -lm
 TARGET  = target
-VERSION := $(shell cat version)
+VERSION  := $(shell cat version)
 DEB_ARCH := $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
+
+# BUILD_TYPE controls whether packages carry a SNAPSHOT suffix.
+# Default: SNAPSHOT (local/CI builds).  Pass BUILD_TYPE=RELEASE for releases.
+BUILD_TYPE ?= SNAPSHOT
+ifeq ($(BUILD_TYPE),RELEASE)
+FULL_VERSION := $(VERSION)
+RPM_RELEASE  := 1
+else
+FULL_VERSION := $(VERSION)-SNAPSHOT
+RPM_RELEASE  := SNAPSHOT
+endif
+
+CFLAGS  = -std=c11 -Wall -Wextra -I ../include -I src -static \
+          -DDB2DELTA_VERSION=\"$(FULL_VERSION)\"
 
 SNIPRUN = ../snip/sniprun
 
@@ -25,7 +37,7 @@ $(TARGET)/db2delta: $(SRC) | $(TARGET)
 	$(CC) $(CFLAGS) -o $@ $(SRC) -x none $(LDFLAGS)
 
 $(TARGET)/db2delta.1.gz: man/db2delta.1 | $(TARGET)
-	sed 's/@VERSION@/$(VERSION)/g' man/db2delta.1 | gzip -9 > $@
+	sed 's/@VERSION@/$(FULL_VERSION)/g' man/db2delta.1 | gzip -9 > $@
 
 man: $(TARGET)/db2delta.1.gz
 
@@ -61,13 +73,14 @@ rpm: all
 	rpmbuild \
 	  --define "_topdir $(RPM_TOPDIR)" \
 	  --define "version $(VERSION)" \
+	  --define "pkg_release $(RPM_RELEASE)" \
 	  --define "srcdir $(CURDIR)/$(TARGET)" \
 	  --define "projdir $(CURDIR)" \
 	  -bb packaging/db2delta.spec
 	@echo "RPM: $$(find $(RPM_TOPDIR)/RPMS -name '*.rpm')"
 
 deb: all
-	$(eval STAGE := $(TARGET)/db2delta_$(VERSION)_$(DEB_ARCH))
+	$(eval STAGE := $(TARGET)/db2delta_$(FULL_VERSION)_$(DEB_ARCH))
 	@rm -rf $(STAGE)
 	@mkdir -p $(STAGE)/usr/bin $(STAGE)/etc/bash_completion.d \
 	          $(STAGE)/usr/share/man/man1 $(STAGE)/DEBIAN
@@ -75,10 +88,10 @@ deb: all
 	install -m 0644 completions/db2delta.bash \
 	                $(STAGE)/etc/bash_completion.d/db2delta
 	install -m 0644 $(TARGET)/db2delta.1.gz  $(STAGE)/usr/share/man/man1/db2delta.1.gz
-	sed 's/@VERSION@/$(VERSION)/g; s/@ARCH@/$(DEB_ARCH)/g' \
+	sed 's/@VERSION@/$(FULL_VERSION)/g; s/@ARCH@/$(DEB_ARCH)/g' \
 	  packaging/deb/DEBIAN/control.in > $(STAGE)/DEBIAN/control
-	dpkg-deb --build $(STAGE) $(TARGET)/db2delta_$(VERSION)_$(DEB_ARCH).deb
+	dpkg-deb --build $(STAGE) $(TARGET)/db2delta_$(FULL_VERSION)_$(DEB_ARCH).deb
 	@rm -rf $(STAGE)
-	@echo "DEB: $(TARGET)/db2delta_$(VERSION)_$(DEB_ARCH).deb"
+	@echo "DEB: $(TARGET)/db2delta_$(FULL_VERSION)_$(DEB_ARCH).deb"
 
 package: rpm deb

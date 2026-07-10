@@ -37,11 +37,28 @@ static void test_dsn_parse(void) {
 }
 
 static void test_version_mode(void) {
-    printf("  T6: version subcommand → MODE_VERSION\n");
+    printf("  T6: -v flag → MODE_SELF_VERSION (no DB needed)\n");
     db2delta_args_t a; memset(&a, 0, sizeof(a));
-    char *argv[] = {"db2delta", "version", NULL};
+    char *argv[] = {"db2delta", "-v", NULL};
     CHECK_EQ(args_parse(2, argv, &a), 0);
-    CHECK_EQ(a.mode, MODE_VERSION);
+    CHECK_EQ(a.mode, MODE_SELF_VERSION);
+
+    printf("  T6b: version subcommand -d h/DB -u u → MODE_DB_VERSION\n");
+    memset(&a, 0, sizeof(a));
+    char *argv2[] = {"db2delta", "version", "-d", "h/DB", "-u", "u", NULL};
+    CHECK_EQ(args_parse(6, argv2, &a), 0);
+    CHECK_EQ(a.mode, MODE_DB_VERSION);
+
+    printf("  T6c: version subcommand missing -d → error\n");
+    memset(&a, 0, sizeof(a));
+    char *argv3[] = {"db2delta", "version", "-u", "u", NULL};
+    CHECK(args_parse(4, argv3, &a) != 0 || a.mode == MODE_USAGE);
+
+    printf("  T6d: -v short-circuits all other args\n");
+    memset(&a, 0, sizeof(a));
+    char *argv4[] = {"db2delta", "-v", "apply", "-d", "h/DB", NULL};
+    CHECK_EQ(args_parse(5, argv4, &a), 0);
+    CHECK_EQ(a.mode, MODE_SELF_VERSION);
 }
 
 static void test_exec_mode(void) {
@@ -109,38 +126,32 @@ static void test_password(void) {
 }
 
 static void test_subcommand_edge_cases(void) {
-    printf("  T13: version replaces self-version mode, no DSN required\n");
-    db2delta_args_t a; memset(&a, 0, sizeof(a));
-    char *argv[] = {"db2delta", "version", NULL};
-    CHECK_EQ(args_parse(2, argv, &a), 0);
-    CHECK_EQ(a.mode, MODE_VERSION);
-
-    printf("  T14: DB2DELTA_VERSION macro is a non-empty string\n");
+    printf("  T13: DB2DELTA_VERSION macro is a non-empty string with dot\n");
     const char *ver = DB2DELTA_VERSION;
     CHECK(ver != NULL && ver[0] != '\0');
     CHECK(strchr(ver, '.') != NULL);
 
-    printf("  T15: flags before subcommand work\n");
-    memset(&a, 0, sizeof(a));
+    printf("  T14: flags before subcommand work\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
     char *argv2[] = {"db2delta", "-d", "h/DB", "-u", "u", "exec",
                      "SELECT 1", NULL};
     CHECK_EQ(args_parse(7, argv2, &a), 0);
     CHECK_EQ(a.mode, MODE_EXEC);
     CHECK_STR(a.query, "SELECT 1");
 
-    printf("  T16: unknown subcommand → error\n");
+    printf("  T15: unknown subcommand → error\n");
     memset(&a, 0, sizeof(a));
     char *argv3[] = {"db2delta", "badcmd", NULL};
     CHECK_EQ(args_parse(2, argv3, &a), -1);
     CHECK_EQ(a.mode, MODE_USAGE);
 
-    printf("  T17: exec missing SQL arg → error\n");
+    printf("  T16: exec missing SQL arg → error\n");
     memset(&a, 0, sizeof(a));
     char *argv4[] = {"db2delta", "exec", "-d", "h/DB", "-u", "u", NULL};
     CHECK_EQ(args_parse(6, argv4, &a), -1);
     CHECK_EQ(a.mode, MODE_USAGE);
 
-    printf("  T18: apply missing files → error\n");
+    printf("  T17: apply missing files → error\n");
     memset(&a, 0, sizeof(a));
     char *argv5[] = {"db2delta", "apply", "-d", "h/DB", "-u", "u", NULL};
     CHECK_EQ(args_parse(6, argv5, &a), -1);

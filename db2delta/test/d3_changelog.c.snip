@@ -37,6 +37,15 @@ int main(void) {
     int qmarks = 0;
     for (const char *p = buf; *p; p++) if (*p == '?') qmarks++;
     CHECK(qmarks == 4);
+    printf("  T5: LATEST SQL selects from DBDELTA_CHANGELOG ordered by APPLIED_AT\n");
+    changelog_latest_sql(buf, sizeof(buf));
+    CHECK(strstr(buf, "DBDELTA_CHANGELOG") != NULL);
+    CHECK(strstr(buf, "CHANGESET") != NULL);
+    CHECK(strstr(buf, "FILENAME") != NULL);
+    CHECK(strstr(buf, "APPLIED_AT") != NULL);
+    CHECK(strstr(buf, "ORDER BY") != NULL);
+    CHECK(strstr(buf, "FETCH FIRST") != NULL);
+
     print_results("d3_changelog");
     return 0;
 }

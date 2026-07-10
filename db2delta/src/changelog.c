@@ -143,3 +143,42 @@ int changelog_record(db2delta_conn_t *c,
     SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
     return result;
 }
+
+void changelog_latest_sql(char *buf, size_t buf_sz) {
+    snprintf(buf, buf_sz,
+        "SELECT CHANGESET, FILENAME, APPLIED_AT "
+        "FROM DBDELTA_CHANGELOG "
+        "ORDER BY APPLIED_AT DESC "
+        "FETCH FIRST 1 ROW ONLY");
+}
+
+int changelog_latest(db2delta_conn_t *c, changelog_entry_t *out) {
+    char sql[256];
+    changelog_latest_sql(sql, sizeof(sql));
+
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+    SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_STMT, c->hdbc, &hstmt);
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) return -1;
+
+    rc = SQLExecDirect(hstmt, (SQLCHAR *)sql, SQL_NTS);
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        conn_print_diag(SQL_HANDLE_STMT, hstmt, "changelog_latest");
+        SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+        return -1;
+    }
+
+    SQLLEN ind_cs = 0, ind_fn = 0, ind_at = 0;
+    SQLBindCol(hstmt, 1, SQL_C_CHAR,
+               out->changeset, sizeof(out->changeset), &ind_cs);
+    SQLBindCol(hstmt, 2, SQL_C_CHAR,
+               out->filename,  sizeof(out->filename),  &ind_fn);
+    SQLBindCol(hstmt, 3, SQL_C_CHAR,
+               out->applied_at, sizeof(out->applied_at), &ind_at);
+
+    rc = SQLFetch(hstmt);
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+
+    if (rc == SQL_NO_DATA) return 1;   /* table exists but is empty */
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) return -1;
+    return 0;
+}

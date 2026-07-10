@@ -1,6 +1,6 @@
 Name:        db2delta
 Version:     %{version}
-Release:     1%{?dist}
+Release:     %{pkg_release}%{?dist}
 Summary:     Zero-dependency DB2 schema migration tool
 License:     MIT
 BuildArch:   x86_64
