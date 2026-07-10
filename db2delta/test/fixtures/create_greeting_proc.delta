@@ -4,6 +4,7 @@ logging=debug
 
 # Stored procedure that uses ; internally — requires @ terminator
 [changeset:create_greeting_proc]
+
 CREATE OR REPLACE PROCEDURE greeting(IN p_name VARCHAR(50), OUT p_msg VARCHAR(100))
 LANGUAGE SQL
 BEGIN
@@ -13,4 +14,5 @@ BEGIN
 END@
 
 [validation:greeting_proc_exists]
+
 SELECT 1 FROM syscat.routines WHERE routinename = 'GREETING' AND routineschema = CURRENT SCHEMA@
