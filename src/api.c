@@ -670,7 +670,7 @@ static char *expand_sql_params(const char *sql,
                                    ? (int)strlen(sv) : (int)ind;
                         /* Build 'value' with '' escaping */
                         char *lp = lit;
-                        char *end = lit + sizeof lit - 2;
+                        const char *end = lit + sizeof lit - 2;
                         *lp++ = '\'';
                         for (int i = 0; i < slen && lp < end; i++) {
                             if (sv[i] == '\'') {

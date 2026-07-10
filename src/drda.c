@@ -1418,8 +1418,10 @@ void drda_close_cursor(sdb2_stmt_t *stmt) {
             if (r == SDB2_OK) {
                 ddm_begin_collection(b, CP_CLSQRY);
                 r = build_pkgnamcsn_section(b, conn->rdbnam_ebcdic, stmt->section);
-                if (r == SDB2_OK) ddm_end_collection(b);
-                if (r == SDB2_OK) r = dss_finalize(b);
+                if (r == SDB2_OK) {
+                    ddm_end_collection(b);
+                    r = dss_finalize(b);
+                }
             }
             if (r == SDB2_OK) r = drda_flush(conn);
             if (r == SDB2_OK) {
