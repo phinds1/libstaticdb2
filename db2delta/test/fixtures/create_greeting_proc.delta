@@ -1,0 +1,16 @@
+terminator=@
+author=test
+logging=debug
+
+# Stored procedure that uses ; internally — requires @ terminator
+[changeset:create_greeting_proc]
+CREATE OR REPLACE PROCEDURE greeting(IN p_name VARCHAR(50), OUT p_msg VARCHAR(100))
+LANGUAGE SQL
+BEGIN
+  DECLARE v_msg VARCHAR(100);
+  SET v_msg = 'Hello, ' || p_name || '!';
+  SET p_msg = v_msg;
+END@
+
+[validation:greeting_proc_exists]
+SELECT 1 FROM syscat.routines WHERE routinename = 'GREETING' AND routineschema = CURRENT SCHEMA@

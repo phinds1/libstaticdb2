@@ -10,20 +10,20 @@ client libraries, and no `~db2inst1` home directory.
 ## Quick start
 
 ```bash
+# Print tool version
+db2delta version
+
 # Apply all pending deltas in a directory
-db2delta -d db2host:50000/MYDB -u db2inst1 -p mypass -s ./deltas/
+db2delta apply -d db2host:50000/MYDB -u db2inst1 -p mypass ./deltas/
 
 # Run arbitrary SQL
-db2delta -d db2host:50000/MYDB -u db2inst1 -p mypass -q "SELECT COUNT(*) FROM MYTABLE"
-
-# Print server version
-db2delta -d db2host:50000/MYDB -u db2inst1 -p mypass -V
+db2delta exec -d db2host:50000/MYDB -u db2inst1 -p mypass "SELECT COUNT(*) FROM MYTABLE"
 ```
 
 Or create `database.env` in the working directory and just run:
 
 ```bash
-db2delta -s ./deltas/
+db2delta apply ./deltas/
 ```
 
 ---
@@ -31,26 +31,35 @@ db2delta -s ./deltas/
 ## Usage
 
 ```
-db2delta -d host[:port]/database -u user [-p password] <mode>
+Usage: db2delta <subcommand> [options]
 
-Modes:
-  -V                    Print server version and exit
-  -q <SQL>              Execute arbitrary SQL and print results
-  -s <file|dir>...      Apply delta files (default mode)
+Subcommands:
+  version                       Print db2delta version and exit
+  exec   -d <dsn> -u <user> <SQL>    Execute SQL and print results
+  apply  -d <dsn> -u <user> <file|dir>...   Apply delta files
 
-Options:
-  -d <dsn>              host[:port]/database  (port defaults to 50000)
-  -u <user>             DB2 username
-  -p <password>         DB2 password (omit to use database.env)
-  -c, --continue-on-error  Do not stop on changeset error
-  -x                    Scripting mode: minimal output, strict exit codes
+Options (exec, apply):
+  -d <host[:port]/database>     DB2 connection DSN (port defaults to 50000)
+  -u <user>                     DB2 username
+  -p <password>                 DB2 password (or set in database.env)
+  -c, --continue-on-error       Do not abort on changeset error
+  -x                            Script mode: minimal output, strict exit codes
+```
+
+Examples:
+
+```bash
+db2delta version
+db2delta exec -d myhost/MYDB -u db2inst1 "SELECT 1 FROM SYSIBM.SYSDUMMY1"
+db2delta apply -d myhost/MYDB -u db2inst1 changes/001_add_users.delta
+db2delta apply -d myhost/MYDB -u db2inst1 -c migrations/
 ```
 
 ---
 
 ## Delta file format
 
-Delta files use a simple `.ini`-inspired format.  Files must end in `.delta`.
+Delta files use a simple `.ini`-inspired format. Files must end in `.delta`.
 
 ```ini
 # Optional header — key=value pairs before the first section
@@ -87,7 +96,7 @@ SELECT COUNT(*) FROM syscat.tables WHERE tabname='USERS';
 
 ### File ordering
 
-When a directory is passed with `-s`, files are ordered **ASCII-betically by
+When a directory is passed to `apply`, files are ordered **ASCII-betically by
 filename** (byte-wise `strcmp` on the basename). This means numeric prefixes sort
 as strings: `10_x.delta` comes before `2_y.delta`. Use zero-padded dates or
 sequence numbers for reliable ordering:
@@ -101,7 +110,7 @@ sequence numbers for reliable ordering:
 ### Terminator note
 
 Statement splitting is naive: the terminator character is split on everywhere in
-the section body.  If your SQL contains the terminator inside a string literal,
+the section body. If your SQL contains the terminator inside a string literal,
 use `terminator=@` and end each statement with `@`.
 
 ---
@@ -121,7 +130,7 @@ CREATE TABLE DBDELTA_CHANGELOG (
 );
 ```
 
-Each applied changeset is recorded by name.  Re-running `db2delta` over an
+Each applied changeset is recorded by name. Re-running `db2delta` over an
 already-applied set is a **no-op** (exit 0).
 
 The SHA256 column stores a hex-encoded SHA-256 of the canonical changeset SQL
@@ -129,7 +138,7 @@ The SHA256 column stores a hex-encoded SHA-256 of the canonical changeset SQL
 
 ### No rollback
 
-`db2delta` is **forward-only**.  There is no rollback mechanism.  If a changeset
+`db2delta` is **forward-only**. There is no rollback mechanism. If a changeset
 fails, already-applied changesets in the same run remain applied and recorded.
 Use `--continue-on-error` to log errors and proceed, or fix the issue and re-run.
 
@@ -138,17 +147,17 @@ Use `--continue-on-error` to log errors and proceed, or fix the issue and re-run
 ## database.env
 
 Create `./database.env` in the working directory to avoid repeating connection
-flags on every invocation:
+settings:
 
-```ini
+```dotenv
 DSN=db2host:50000/MYDB
 USER=db2inst1
-PASSWORD=secret
-CONTINUE_ON_ERROR=false
+PASSWORD=example-pass
+CONTINUE_ON_ERROR=true
 SCRIPT=false
 ```
 
-CLI flags always override `database.env`.
+`database.env` provides defaults. CLI flags always take precedence.
 
 ---
 
@@ -175,7 +184,7 @@ make db2delta-test
 local-integration/tests/run-db2delta-integration.sh
 ```
 
-Requires `musl-gcc` and `make`.  The binary is fully static; copy it anywhere.
+Requires `musl-gcc` and `make`. The binary is fully static; copy it anywhere.
 
 ---
 

@@ -2,23 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../src/delta.h"
-
-static int failed = 0;
-static int passed = 0;
-
-#define CHECK(expr) \
-    do { if (!(expr)) { \
-        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
-    } else { passed++; } } while(0)
-#define CHECK_EQ(a,b) \
-    do { if ((a)!=(b)) { \
-        printf("  FAIL [%d]: %s==%s  (%d != %d)\n", \
-               __LINE__, #a, #b, (int)(a), (int)(b)); failed++; \
-    } else { passed++; } } while(0)
-#define CHECK_STR(a,b) \
-    do { if (strcmp((a),(b))!=0) { \
-        printf("  FAIL [%d]: '%s' != '%s'\n", __LINE__, (a), (b)); failed++; \
-    } else { passed++; } } while(0)
+#include "asserts.h"
 
 static void test_basic_parse(void) {
     printf("  T1: Parse fixtures/sample.delta\n");
@@ -119,6 +103,35 @@ static void test_trailing_empty(void) {
     delta_free(&f);
 }
 
+static void test_at_terminator_fixture(void) {
+    printf("  T6: fixtures/create_greeting_proc.delta — @ terminated stored proc\n");
+    delta_file_t f;
+    int r = delta_parse_file("fixtures/create_greeting_proc.delta", &f);
+    CHECK_EQ(r, 0);
+    CHECK_EQ(f.terminator, '@');
+    CHECK_EQ(f.section_count, 2);
+
+    /* changeset: one statement containing internal semicolons */
+    delta_section_t *cs = &f.sections[0];
+    CHECK_EQ(cs->kind, DELTA_CHANGESET);
+    CHECK_STR(cs->name, "create_greeting_proc");
+    CHECK_EQ(cs->stmt_count, 1);
+    CHECK(strstr(cs->stmts[0], "CREATE") != NULL);
+    CHECK(strstr(cs->stmts[0], "PROCEDURE") != NULL);
+    /* internal semicolons must be preserved intact */
+    CHECK(strstr(cs->stmts[0], "SET v_msg") != NULL);
+    CHECK(strstr(cs->stmts[0], "SET p_msg") != NULL);
+
+    /* validation section */
+    delta_section_t *vs = &f.sections[1];
+    CHECK_EQ(vs->kind, DELTA_VALIDATION);
+    CHECK_STR(vs->name, "greeting_proc_exists");
+    CHECK_EQ(vs->stmt_count, 1);
+    CHECK(strstr(vs->stmts[0], "syscat.routines") != NULL);
+
+    delta_free(&f);
+}
+
 int main(void) {
     printf("=== Phase 4 — delta file parser tests ===\n\n");
     test_basic_parse();
@@ -126,6 +139,7 @@ int main(void) {
     test_multi_stmt();
     test_comment_skip();
     test_trailing_empty();
-    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
-    return failed ? 1 : 0;
+    test_at_terminator_fixture();
+    print_results("d4_delta");
+    return 0;
 }

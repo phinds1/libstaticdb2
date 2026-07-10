@@ -7,7 +7,7 @@ SNIPRUN = ./snip/sniprun
 LIB_SRC = src/buf.c src/net.c src/ccsid.c src/dss.c src/ddm.c src/drda.c src/sqlca.c src/fdoca.c src/handles.c src/api.c src/async.c
 LIB_OBJ = $(LIB_SRC:.c=.o)
 
-.PHONY: all lib test lint clean check db2delta db2delta-test
+.PHONY: all lib test lint clean check db2delta db2delta-test db2delta-lint
 
 all: lib
 
@@ -82,4 +82,7 @@ db2delta: lib
 
 db2delta-test: db2delta
 	$(MAKE) -C db2delta test
+
+db2delta-lint: db2delta
+	$(MAKE) -C db2delta lint
 

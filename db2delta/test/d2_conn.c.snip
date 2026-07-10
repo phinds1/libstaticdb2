@@ -3,14 +3,7 @@
 #include <string.h>
 #include "../src/args.h"
 #include "../src/conn.h"
-
-static int failed = 0;
-static int passed = 0;
-
-#define CHECK(expr) \
-    do { if (!(expr)) { \
-        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
-    } else { passed++; } } while(0)
+#include "asserts.h"
 
 int main(void) {
     printf("=== Phase 2 — conn_open failure test ===\n\n");
@@ -32,8 +25,7 @@ int main(void) {
     /* conn_close on an already-failed open must not crash */
     printf("  T2: conn_close after failed open → no crash\n");
     conn_close(&conn);
-    passed++; /* reached here = no crash */
-
-    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
-    return failed ? 1 : 0;
+    assert_pass++; /* reached here = no crash */
+    print_results("d2_conn");
+    return 0;
 }

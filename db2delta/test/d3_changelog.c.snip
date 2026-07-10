@@ -2,14 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../src/changelog.h"
-
-static int failed = 0;
-static int passed = 0;
-
-#define CHECK(expr) \
-    do { if (!(expr)) { \
-        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
-    } else { passed++; } } while(0)
+#include "asserts.h"
 
 int main(void) {
     printf("=== Phase 3 — changelog SQL builder tests ===\n\n");
@@ -44,7 +37,6 @@ int main(void) {
     int qmarks = 0;
     for (const char *p = buf; *p; p++) if (*p == '?') qmarks++;
     CHECK(qmarks == 4);
-
-    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
-    return failed ? 1 : 0;
+    print_results("d3_changelog");
+    return 0;
 }

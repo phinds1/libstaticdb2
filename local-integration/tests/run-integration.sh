@@ -24,7 +24,7 @@ export DB2_TEST_HOST DB2_TEST_PORT DB2_TEST_DB DB2_TEST_USER DB2_TEST_PASS
 # ── Build + Run via sniprun ────────────────────────────────────────────────────
 echo "=== Running integration tests against ${DB2_TEST_HOST}:${DB2_TEST_PORT}/${DB2_TEST_DB} ==="
 cd "${REPO_ROOT}"
-./snip/sniprun test/p16_integration.in
+./snip/sniprun test/p16_integration.c.snip
 RC=$?
 
 if [[ $RC -eq 0 ]]; then

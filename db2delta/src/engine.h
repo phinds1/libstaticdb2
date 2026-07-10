@@ -29,7 +29,7 @@ int engine_apply(db2delta_conn_t *c, const db2delta_args_t *args,
                  engine_result_t *result);
 
 /* Execute an arbitrary SQL query and print result rows to stdout.
- * Used for -q mode. */
+ * Used for the exec subcommand. */
 int engine_query(db2delta_conn_t *c, const char *sql, int script_mode);
 
 /* Evaluate a validation section.

@@ -4,10 +4,10 @@
 #define DB2DELTA_MAX_FILES 256
 
 typedef enum {
-    MODE_USAGE = 0,
-    MODE_VERSION,
-    MODE_QUERY,
-    MODE_APPLY
+    MODE_USAGE   = 0,
+    MODE_VERSION,   /* version subcommand — print tool version, no DB needed */
+    MODE_EXEC,      /* exec subcommand — execute arbitrary SQL */
+    MODE_APPLY      /* apply subcommand — apply delta files */
 } db2delta_mode_t;
 
 typedef struct {
@@ -22,9 +22,9 @@ typedef struct {
     char password[256];
     /* Mode */
     db2delta_mode_t mode;
-    /* -q: arbitrary SQL query */
+    /* exec: arbitrary SQL query */
     char query[4096];
-    /* -s: list of delta files / directories */
+    /* apply: list of delta files / directories */
     char *sql_files[DB2DELTA_MAX_FILES];
     int   sql_file_count;
     /* Flags */

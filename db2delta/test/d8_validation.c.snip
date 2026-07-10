@@ -3,9 +3,7 @@
 #include <string.h>
 #include "../src/engine.h"
 #include "../../include/staticdb2/sdb2.h"
-
-static int failed = 0;
-static int passed = 0;
+#include "asserts.h"
 
 #define CHECK_PASS(had_row, val_ptr, expected) \
     do { \
@@ -13,8 +11,8 @@ static int passed = 0;
         if (p != (expected)) { \
             printf("  FAIL [%d]: validation_passes(%d,...) = %d expected %d\n", \
                    __LINE__, had_row, p, expected); \
-            failed++; \
-        } else { passed++; } \
+            assert_fail++; \
+        } else { assert_pass++; } \
     } while(0)
 
 static sdb2_value_t make_int32(int32_t v) {
@@ -64,7 +62,6 @@ int main(void) {
     printf("  T7: integer 1 → pass\n");
     sdb2_value_t one = make_int32(1);
     CHECK_PASS(1, &one, 1);
-
-    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
-    return failed ? 1 : 0;
+    print_results("d8_validation");
+    return 0;
 }

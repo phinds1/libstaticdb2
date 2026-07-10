@@ -52,7 +52,7 @@ static int run_changeset(db2delta_conn_t *c, const delta_section_t *sec,
     return any_fail ? -1 : 0;
 }
 
-/* ── engine_query: -q arbitrary SQL ─────────────────────────────────────── */
+/* ── engine_query: exec subcommand arbitrary SQL ─────────────────────────── */
 
 int engine_query(db2delta_conn_t *c, const char *sql, int script_mode) {
     SQLHSTMT hstmt = SQL_NULL_HANDLE;

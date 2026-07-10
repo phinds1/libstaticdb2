@@ -25,7 +25,7 @@ make db2delta -s
 # ── Run snip integration test ──────────────────────────────────────────────
 echo ""
 echo "=== Running db2delta integration tests against ${DB2_TEST_HOST}:${DB2_TEST_PORT}/${DB2_TEST_DB} ==="
-./snip/sniprun db2delta/test/d_integration.in
+./snip/sniprun db2delta/test/d_integration.c.snip
 RC=$?
 
 # ── End-to-end binary smoke tests ─────────────────────────────────────────

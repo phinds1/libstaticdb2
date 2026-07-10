@@ -1,0 +1,58 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            musl-tools \
+            cppcheck \
+            rpm \
+            dpkg-dev
+
+      - name: Build libstaticdb2
+        run: make lib
+
+      - name: Test libstaticdb2
+        run: make test
+
+      - name: Lint libstaticdb2
+        run: make lint
+
+      - name: Build db2delta
+        run: make db2delta
+
+      - name: Test db2delta
+        run: make db2delta-test
+
+      - name: Lint db2delta
+        run: make db2delta-lint
+
+      - name: Package db2delta (RPM + DEB)
+        run: make -C db2delta package
+
+      - name: Upload RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: db2delta-rpm
+          path: db2delta/packaging/rpmbuild/RPMS/**/*.rpm
+          if-no-files-found: error
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: db2delta-deb
+          path: db2delta/packaging/*.deb
+          if-no-files-found: error

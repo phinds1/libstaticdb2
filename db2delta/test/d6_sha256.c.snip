@@ -3,9 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "../src/sha256.h"
-
-static int failed = 0;
-static int passed = 0;
+#include "asserts.h"
 
 #define CHECK_HEX(input, input_len, expected) \
     do { \
@@ -14,11 +12,11 @@ static int passed = 0;
         if (strcmp(hex, (expected)) != 0) { \
             printf("  FAIL [%d]: sha256(\"%s\") =\n    %s\n  expected:\n    %s\n", \
                    __LINE__, (input), hex, (expected)); \
-            failed++; \
+            assert_fail++; \
         } else { \
             printf("  PASS: sha256(\"%.*s...\") OK\n", \
                    (int)((input_len) < 16 ? (input_len) : 16), (input)); \
-            passed++; \
+            assert_pass++; \
         } \
     } while(0)
 
@@ -39,7 +37,6 @@ int main(void) {
     /* One more: "The quick brown fox jumps over the lazy dog" */
     CHECK_HEX("The quick brown fox jumps over the lazy dog", 43,
         "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592");
-
-    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
-    return failed ? 1 : 0;
+    print_results("d6_sha256");
+    return 0;
 }

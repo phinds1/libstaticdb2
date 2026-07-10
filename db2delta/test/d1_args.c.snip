@@ -1,0 +1,164 @@
+/* Phase 1 — db2delta arg parsing unit tests (no DB needed) */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "../src/args.h"
+#include "asserts.h"
+
+static void test_dsn_parse(void) {
+    printf("  T1: DSN parse host:port/db\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    CHECK_EQ(args_parse_dsn("db2host:50000/TESTDB", &a), 0);
+    CHECK_STR(a.host, "db2host");
+    CHECK_EQ(a.port, 50000);
+    CHECK_STR(a.database, "TESTDB");
+
+    printf("  T2: DSN parse host/db (no port)\n");
+    memset(&a, 0, sizeof(a));
+    CHECK_EQ(args_parse_dsn("myhost/MYDB", &a), 0);
+    CHECK_STR(a.host, "myhost");
+    CHECK_EQ(a.port, 0);
+    CHECK_STR(a.database, "MYDB");
+
+    printf("  T3: DSN with 127.0.0.1\n");
+    memset(&a, 0, sizeof(a));
+    CHECK_EQ(args_parse_dsn("127.0.0.1:50001/SAMPLEDB", &a), 0);
+    CHECK_STR(a.host, "127.0.0.1");
+    CHECK_EQ(a.port, 50001);
+    CHECK_STR(a.database, "SAMPLEDB");
+
+    printf("  T4: DSN missing slash → error\n");
+    memset(&a, 0, sizeof(a));
+    CHECK_EQ(args_parse_dsn("noslash", &a), -1);
+
+    printf("  T5: DSN port out of range → error\n");
+    memset(&a, 0, sizeof(a));
+    CHECK_EQ(args_parse_dsn("host:99999/DB", &a), -1);
+}
+
+static void test_version_mode(void) {
+    printf("  T6: version subcommand → MODE_VERSION\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    char *argv[] = {"db2delta", "version", NULL};
+    CHECK_EQ(args_parse(2, argv, &a), 0);
+    CHECK_EQ(a.mode, MODE_VERSION);
+}
+
+static void test_exec_mode(void) {
+    printf("  T7: exec -d h/DB -u u 'SELECT 1' → MODE_EXEC\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    char *argv[] = {"db2delta", "exec", "-d", "h/DB", "-u", "u",
+                    "SELECT 1 FROM SYSIBM.SYSDUMMY1", NULL};
+    CHECK_EQ(args_parse(7, argv, &a), 0);
+    CHECK_EQ(a.mode, MODE_EXEC);
+    CHECK_STR(a.query, "SELECT 1 FROM SYSIBM.SYSDUMMY1");
+}
+
+static void test_apply_mode(void) {
+    printf("  T8: apply -d h/DB -u u a.delta b.delta → MODE_APPLY, 2 files\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    char *argv[] = {"db2delta", "apply", "-d", "h/DB", "-u", "u",
+                    "a.delta", "b.delta", NULL};
+    CHECK_EQ(args_parse(8, argv, &a), 0);
+    CHECK_EQ(a.mode, MODE_APPLY);
+    CHECK_EQ(a.sql_file_count, 2);
+    CHECK_STR(a.sql_files[0], "a.delta");
+    CHECK_STR(a.sql_files[1], "b.delta");
+}
+
+static void test_flags(void) {
+    printf("  T9: apply -x -c flags\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    char *argv[] = {"db2delta", "apply", "-d", "h/DB", "-u", "u",
+                    "-x", "-c", "a.delta", NULL};
+    CHECK_EQ(args_parse(9, argv, &a), 0);
+    CHECK_EQ(a.script_mode, 1);
+    CHECK_EQ(a.continue_on_error, 1);
+
+    printf("  T9b: apply --continue-on-error long form\n");
+    memset(&a, 0, sizeof(a));
+    char *argv2[] = {"db2delta", "apply", "-d", "h/DB", "-u", "u",
+                     "--continue-on-error", "a.delta", NULL};
+    CHECK_EQ(args_parse(8, argv2, &a), 0);
+    CHECK_EQ(a.continue_on_error, 1);
+}
+
+static void test_missing_dsn(void) {
+    printf("  T10: exec missing -d → error\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    char *argv[] = {"db2delta", "exec", "-u", "u", "SELECT 1", NULL};
+    int r = args_parse(5, argv, &a);
+    CHECK(r != 0 || a.mode == MODE_USAGE);
+}
+
+static void test_missing_user(void) {
+    printf("  T11: exec missing -u → error\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    char *argv[] = {"db2delta", "exec", "-d", "h/DB", "SELECT 1", NULL};
+    int r = args_parse(5, argv, &a);
+    CHECK(r != 0 || a.mode == MODE_USAGE);
+}
+
+static void test_password(void) {
+    printf("  T12: apply -p sets password\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    char *argv[] = {"db2delta", "apply", "-d", "h/DB", "-u", "u",
+                    "-p", "s3cr3t", "a.delta", NULL};
+    CHECK_EQ(args_parse(9, argv, &a), 0);
+    CHECK_STR(a.password, "s3cr3t");
+}
+
+static void test_subcommand_edge_cases(void) {
+    printf("  T13: version replaces self-version mode, no DSN required\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    char *argv[] = {"db2delta", "version", NULL};
+    CHECK_EQ(args_parse(2, argv, &a), 0);
+    CHECK_EQ(a.mode, MODE_VERSION);
+
+    printf("  T14: DB2DELTA_VERSION macro is a non-empty string\n");
+    const char *ver = DB2DELTA_VERSION;
+    CHECK(ver != NULL && ver[0] != '\0');
+    CHECK(strchr(ver, '.') != NULL);
+
+    printf("  T15: flags before subcommand work\n");
+    memset(&a, 0, sizeof(a));
+    char *argv2[] = {"db2delta", "-d", "h/DB", "-u", "u", "exec",
+                     "SELECT 1", NULL};
+    CHECK_EQ(args_parse(7, argv2, &a), 0);
+    CHECK_EQ(a.mode, MODE_EXEC);
+    CHECK_STR(a.query, "SELECT 1");
+
+    printf("  T16: unknown subcommand → error\n");
+    memset(&a, 0, sizeof(a));
+    char *argv3[] = {"db2delta", "badcmd", NULL};
+    CHECK_EQ(args_parse(2, argv3, &a), -1);
+    CHECK_EQ(a.mode, MODE_USAGE);
+
+    printf("  T17: exec missing SQL arg → error\n");
+    memset(&a, 0, sizeof(a));
+    char *argv4[] = {"db2delta", "exec", "-d", "h/DB", "-u", "u", NULL};
+    CHECK_EQ(args_parse(6, argv4, &a), -1);
+    CHECK_EQ(a.mode, MODE_USAGE);
+
+    printf("  T18: apply missing files → error\n");
+    memset(&a, 0, sizeof(a));
+    char *argv5[] = {"db2delta", "apply", "-d", "h/DB", "-u", "u", NULL};
+    CHECK_EQ(args_parse(6, argv5, &a), -1);
+    CHECK_EQ(a.mode, MODE_USAGE);
+}
+
+int main(void) {
+    printf("=== Phase 1 — db2delta arg parsing tests ===\n\n");
+
+    test_dsn_parse();
+    test_version_mode();
+    test_exec_mode();
+    test_apply_mode();
+    test_flags();
+    test_missing_dsn();
+    test_missing_user();
+    test_password();
+    test_subcommand_edge_cases();
+    print_results("d1_args");
+    return 0;
+}

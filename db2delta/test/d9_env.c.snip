@@ -3,24 +3,7 @@
 #include <string.h>
 #include "../src/args.h"
 #include "../src/engine.h"
-
-static int failed = 0;
-static int passed = 0;
-
-#define CHECK(expr) \
-    do { if (!(expr)) { \
-        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
-    } else { passed++; } } while(0)
-#define CHECK_EQ(a,b) \
-    do { if ((a)!=(b)) { \
-        printf("  FAIL [%d]: %d != %d\n", __LINE__, (int)(a),(int)(b)); \
-        failed++; \
-    } else { passed++; } } while(0)
-#define CHECK_STR(a,b) \
-    do { if (strcmp((a),(b))!=0) { \
-        printf("  FAIL [%d]: '%s' != '%s'\n", __LINE__, (a),(b)); \
-        failed++; \
-    } else { passed++; } } while(0)
+#include "asserts.h"
 
 /* Pure exit-code computation (mirrors main.c logic) */
 static int compute_exit_code(const engine_result_t *res, int script_mode) {
@@ -48,9 +31,10 @@ static void test_env_not_override(void) {
     /* Load env file first */
     args_load_env("fixtures/database.env", &a);
     /* Then CLI parse overwrites */
-    char *argv[] = {"db2delta", "-d", "clihost/CLIDB", "-u", "cliuser",
-                    "-p", "clipass", "-V", NULL};
-    CHECK_EQ(args_parse(8, argv, &a), 0);
+    char *argv[] = {"db2delta", "apply", "-d", "clihost/CLIDB", "-u", "cliuser",
+                    "-p", "clipass", "dummy.delta", NULL};
+    CHECK_EQ(args_parse(9, argv, &a), 0);
+    CHECK_EQ(a.mode, MODE_APPLY);
     CHECK_STR(a.host, "clihost");
     CHECK_STR(a.database, "CLIDB");
     CHECK_STR(a.user, "cliuser");
@@ -93,6 +77,6 @@ int main(void) {
     test_env_not_override();
     test_exit_codes();
     test_env_absent();
-    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
-    return failed ? 1 : 0;
+    print_results("d9_env");
+    return 0;
 }

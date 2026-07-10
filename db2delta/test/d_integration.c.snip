@@ -3,8 +3,8 @@
  *
  * Current coverage:
  *   I1.  conn_open + conn_server_version + conn_close
- *   I2.  -V mode end-to-end via engine
- *   I3.  -q mode: SELECT from SYSIBM.SYSDUMMY1
+ *   I2.  connection helpers end-to-end
+ *   I3.  exec mode: SELECT from SYSIBM.SYSDUMMY1
  *   I4.  engine_apply: apply sample.delta (first run)
  *   I5.  engine_apply: re-apply sample.delta (idempotent)
  *   I6.  changelog row present after apply
@@ -17,14 +17,7 @@
 #include "../src/conn.h"
 #include "../src/engine.h"
 #include "../src/changelog.h"
-
-static int failed = 0;
-static int passed = 0;
-
-#define CHECK(expr) \
-    do { if (!(expr)) { \
-        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
-    } else { passed++; } } while(0)
+#include "asserts.h"
 
 static db2delta_args_t build_args(const char *host, int port,
                                    const char *db, const char *uid,
@@ -149,14 +142,61 @@ int main(void) {
         conn_close(&conn);
     }
 
+    /* I7: engine_apply — @ terminated stored procedure */
+    printf("\n  I7: engine_apply create_greeting_proc.delta (@ terminator)\n");
+    {
+        /* clean up any leftover from a previous run */
+        r = conn_open(&conn, &args);
+        if (r == 0) {
+            conn_exec(&conn, "DELETE FROM DBDELTA_CHANGELOG WHERE CHANGESET='create_greeting_proc'");
+            conn_exec(&conn, "DROP PROCEDURE greeting");
+            conn_close(&conn);
+        }
+
+        args.sql_file_count = 1;
+        args.sql_files[0] = "test/fixtures/create_greeting_proc.delta";
+        args.mode = MODE_APPLY;
+        engine_result_t result;
+        memset(&result, 0, sizeof(result));
+        r = conn_open(&conn, &args);
+        CHECK(r == 0);
+        if (r == 0) {
+            int ar = engine_apply(&conn, &args, &result);
+            CHECK(ar == 0);
+            CHECK(result.applied == 1);
+            CHECK(result.failed  == 0);
+            conn_close(&conn);
+        }
+    }
+
+    /* I8: idempotent re-apply of the stored procedure */
+    printf("\n  I8: engine_apply create_greeting_proc.delta (idempotent)\n");
+    {
+        args.sql_file_count = 1;
+        args.sql_files[0] = "test/fixtures/create_greeting_proc.delta";
+        args.mode = MODE_APPLY;
+        engine_result_t result;
+        memset(&result, 0, sizeof(result));
+        r = conn_open(&conn, &args);
+        CHECK(r == 0);
+        if (r == 0) {
+            int ar = engine_apply(&conn, &args, &result);
+            CHECK(ar == 0);
+            CHECK(result.skipped == 1);
+            CHECK(result.failed  == 0);
+            conn_close(&conn);
+        }
+    }
+
     /* cleanup */
     r = conn_open(&conn, &args);
     if (r == 0) {
         conn_exec(&conn, "DELETE FROM DBDELTA_CHANGELOG WHERE CHANGESET='create_users_table'");
         conn_exec(&conn, "DROP TABLE users");
+        conn_exec(&conn, "DELETE FROM DBDELTA_CHANGELOG WHERE CHANGESET='create_greeting_proc'");
+        conn_exec(&conn, "DROP PROCEDURE greeting");
         conn_close(&conn);
     }
-
-    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
-    return failed ? 1 : 0;
+    print_results("d_integration");
+    return 0;
 }

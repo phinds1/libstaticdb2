@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to upload release assets
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Fetch the full history so we can commit the version bump
+          fetch-depth: 0
+          # Use a token that can push back to the repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            musl-tools \
+            cppcheck \
+            rpm \
+            dpkg-dev
+
+      - name: Extract version from release tag
+        id: version
+        run: |
+          # Strip leading 'v' from tag (v1.2.3 → 1.2.3)
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Releasing version: ${VERSION}"
+
+      - name: Update version file
+        run: |
+          echo "${{ steps.version.outputs.version }}" > db2delta/version
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add db2delta/version
+          git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]"
+          git push origin HEAD:${{ github.event.repository.default_branch }}
+
+      - name: Build libstaticdb2
+        run: make lib
+
+      - name: Test libstaticdb2
+        run: make test
+
+      - name: Lint libstaticdb2
+        run: make lint
+
+      - name: Build db2delta
+        run: make db2delta
+
+      - name: Test db2delta
+        run: make db2delta-test
+
+      - name: Lint db2delta
+        run: make db2delta-lint
+
+      - name: Package db2delta
+        run: make -C db2delta package
+
+      - name: Locate packages
+        id: packages
+        run: |
+          RPM=$(find db2delta/packaging/rpmbuild/RPMS -name '*.rpm' | head -1)
+          DEB=$(find db2delta/packaging -maxdepth 1 -name '*.deb' | head -1)
+          echo "rpm=${RPM}" >> "$GITHUB_OUTPUT"
+          echo "deb=${DEB}" >> "$GITHUB_OUTPUT"
+          echo "RPM: ${RPM}"
+          echo "DEB: ${DEB}"
+
+      - name: Upload RPM to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ steps.packages.outputs.rpm }}
+          asset_name: db2delta-${{ steps.version.outputs.version }}-1.x86_64.rpm
+          asset_content_type: application/x-rpm
+
+      - name: Upload DEB to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ steps.packages.outputs.deb }}
+          asset_name: db2delta_${{ steps.version.outputs.version }}_amd64.deb
+          asset_content_type: application/vnd.debian.binary-package

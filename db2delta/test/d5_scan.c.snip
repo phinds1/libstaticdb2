@@ -3,23 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "../src/scan.h"
-
-static int failed = 0;
-static int passed = 0;
-
-#define CHECK(expr) \
-    do { if (!(expr)) { \
-        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
-    } else { passed++; } } while(0)
-#define CHECK_EQ(a,b) \
-    do { if ((a)!=(b)) { \
-        printf("  FAIL [%d]: %s==%s  (%d != %d)\n", \
-               __LINE__, #a, #b, (int)(a), (int)(b)); failed++; \
-    } else { passed++; } } while(0)
-#define CHECK_STR(a,b) \
-    do { if (strcmp((a),(b))!=0) { \
-        printf("  FAIL [%d]: '%s' != '%s'\n", __LINE__, (a), (b)); failed++; \
-    } else { passed++; } } while(0)
+#include "asserts.h"
 
 static void test_sort_basics(void) {
     printf("  T1: scan_sort — byte-wise ascending\n");
@@ -87,6 +71,6 @@ int main(void) {
     test_sort_by_basename();
     test_scan_dir();
     test_sort_single();
-    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
-    return failed ? 1 : 0;
+    print_results("d5_scan");
+    return 0;
 }
