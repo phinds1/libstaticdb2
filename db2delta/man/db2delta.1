@@ -1,0 +1,250 @@
+.TH DB2DELTA 1 "2025-07-10" "db2delta @VERSION@" "User Commands"
+.SH NAME
+db2delta \- 🚧 zero-dependency DB2 schema migration tool
+.SH SYNOPSIS
+.B db2delta
+.I subcommand
+.RI [ options ]
+.PP
+.B db2delta
+.B apply
+.B \-d
+.I host[:port]/db
+.B \-u
+.I user
+.RI [ options ]
+.I file|dir\ .\|.\|.
+.PP
+.B db2delta
+.B exec
+.B \-d
+.I host[:port]/db
+.B \-u
+.I user
+.RI [ options ]
+.I SQL
+.PP
+.B db2delta
+.B version
+.SH DESCRIPTION
+.B db2delta
+🚧 is a statically-compiled, zero-dependency DB2 schema migration tool.
+No Java, no XML, no DB2 client libraries required.
+It ships as a single static binary and speaks the DRDA protocol directly.
+.PP
+Delta files contain versioned SQL changesets.
+.B db2delta
+records applied changesets in a changelog table in the target database
+and skips changesets that have already been applied, making it safe to
+run migrations idempotently.
+.SH SUBCOMMANDS
+.TP
+.B apply
+Connect to DB2 and apply one or more delta files or directories of delta files.
+Skips changesets whose SHA-256 hash is already recorded in the changelog table.
+.TP
+.B exec
+Connect to DB2, execute a single SQL statement, and print the results to
+standard output.
+.TP
+.B version
+Print the db2delta version string and exit.
+.TP
+.B help
+Print a brief usage summary and exit.
+.SH OPTIONS
+.TP
+.BR \-d ", " \-\-database " " \fIhost[:port]/db\fR
+DB2 connection string.
+.I host
+is the hostname or IP address of the DB2 server.
+.I port
+defaults to
+.B 50000
+if omitted.
+.I db
+is the database name (e.g.\& \fBMYDB\fR).
+.TP
+.BR \-u ", " \-\-user " " \fIuser\fR
+DB2 username.
+.TP
+.BR \-p ", " \-\-password " " \fIpassword\fR
+DB2 password.
+If omitted and
+.B \-\-script
+is not set,
+.B db2delta
+prompts for the password on the terminal with echo disabled (the typed
+characters are not displayed).
+In script mode
+.RB ( \-x )
+a missing password is a fatal error.
+If
+.B DB2_PASSWORD
+is set in
+.I database.env
+no prompt is issued.
+.TP
+.BR \-c ", " \-\-continue\-on\-error
+Do not abort on a changeset error.
+By default
+.B db2delta
+stops and rolls back the current changeset on the first error.
+With this flag it logs the failure and continues with the next changeset.
+.TP
+.BR \-x ", " \-\-script
+Script mode.
+Suppresses informational output and uses strict exit codes suitable for
+use in CI pipelines and shell scripts.
+Exit 0 on success, non-zero on any failure.
+.SH DELTA FILE FORMAT
+A delta file is a plain text file with a
+.B .delta
+extension.
+It may contain one or more SQL statements separated by semicolons
+.RB ( ; ).
+.PP
+To include stored procedures or other DDL that itself contains semicolons,
+set the terminator to
+.B @
+in the file header:
+.PP
+.nf
+.RS
+-- terminator=@
+CREATE PROCEDURE greet(IN name VARCHAR(64))
+BEGIN
+  DECLARE msg VARCHAR(128);
+  SET msg = 'Hello, ' || name || '!';
+END@
+.RE
+.fi
+.PP
+Each delta file is identified by its SHA-256 hash.
+Once applied, the hash is recorded in the changelog table
+.RB ( DB2DELTA_CHANGELOG )
+and the changeset will not be re-applied on subsequent runs.
+.SH PASSWORD PROMPT
+If no password is available from
+.B \-p
+or
+.IR database.env ,
+.B db2delta
+opens
+.I /dev/tty
+and prompts:
+.PP
+.nf
+.RS
+Password:
+.RE
+.fi
+.PP
+Terminal echo is disabled for the duration of the input so the password
+is not visible on screen.
+This mirrors the behaviour of tools such as
+.BR ssh (1)
+and
+.BR sudo (1).
+.PP
+In script mode
+.RB ( \-x )
+interactive prompting is suppressed; a missing password causes an
+immediate error exit (code 2) so that pipelines fail cleanly.
+.SH ENVIRONMENT
+If a file named
+.I database.env
+exists in the current working directory its
+.BR key = value
+pairs are read as defaults before command-line flags are processed.
+Command-line flags always take precedence.
+Recognised keys:
+.TP
+.B DB2_HOST
+Equivalent to the
+.B \-d
+host portion.
+.TP
+.B DB2_PORT
+Port number (default 50000).
+.TP
+.B DB2_DATABASE
+Database name.
+.TP
+.B DB2_USER
+Equivalent to
+.BR \-u .
+.TP
+.B DB2_PASSWORD
+Equivalent to
+.BR \-p .
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+One or more changesets failed (or the SQL statement returned an error).
+.TP
+.B 2
+Invalid arguments or connection error.
+.SH EXAMPLES
+Print the installed version:
+.PP
+.nf
+.RS
+db2delta version
+.RE
+.fi
+.PP
+Apply all delta files in a directory:
+.PP
+.nf
+.RS
+db2delta apply \-d myhost/MYDB \-u db2inst1 migrations/
+.RE
+.fi
+.PP
+Apply a single delta file, continuing past errors:
+.PP
+.nf
+.RS
+db2delta apply \-d myhost/MYDB \-u db2inst1 \-c 001_add_users.delta
+.RE
+.fi
+.PP
+Execute an ad-hoc SQL statement:
+.PP
+.nf
+.RS
+db2delta exec \-d myhost/MYDB \-u db2inst1 \e
+    "SELECT TABNAME FROM SYSCAT.TABLES WHERE TABSCHEMA='DB2INST1'"
+.RE
+.fi
+.PP
+Use a
+.I database.env
+file to avoid repeating connection flags:
+.PP
+.nf
+.RS
+echo "DB2_HOST=myhost
+DB2_DATABASE=MYDB
+DB2_USER=db2inst1
+DB2_PASSWORD=secret" > database.env
+db2delta apply migrations/
+.RE
+.fi
+.SH FILES
+.TP
+.I ./database.env
+Optional per-project connection defaults.
+.TP
+.I /etc/bash_completion.d/db2delta
+Bash tab-completion script installed with the package.
+.SH SEE ALSO
+.BR db2 (1)
+.SH AUTHOR
+Written by the libstaticdb2 project contributors.
+.SH LICENSE
+MIT License.

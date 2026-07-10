@@ -19,14 +19,18 @@ in a changelog table, and validate results — all from a single binary.
 %install
 mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_sysconfdir}/bash_completion.d
+mkdir -p %{buildroot}%{_mandir}/man1
 install -m 0755 %{srcdir}/db2delta \
                 %{buildroot}%{_bindir}/db2delta
-install -m 0644 %{srcdir}/completions/db2delta.bash \
+install -m 0644 %{projdir}/completions/db2delta.bash \
                 %{buildroot}%{_sysconfdir}/bash_completion.d/db2delta
+install -m 0644 %{srcdir}/db2delta.1.gz \
+                %{buildroot}%{_mandir}/man1/db2delta.1.gz
 
 %files
 %{_bindir}/db2delta
 %{_sysconfdir}/bash_completion.d/db2delta
+%{_mandir}/man1/db2delta.1.gz
 
 %changelog
 * Thu Jul 10 2025 Build System <build@localhost> - %{version}-1

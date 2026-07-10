@@ -8,6 +8,6 @@ snip_test=d2_conn
 musl-gcc -std=c11 -Wall -Wextra -I ../../include -I ../src -static \
     -DDB2DELTA_VERSION=\"$(cat ../version)\" \
     -o run_$snip_test $snip_test.c \
-    ../src/args.c ../src/conn.c -x none ../../libstaticdb2.a -lm \
+    ../src/args.c ../src/conn.c -x none ../../target/libstaticdb2.a -lm \
     && ./run_$snip_test \
     && rm -f ./run_$snip_test ./${snip_test}.c
