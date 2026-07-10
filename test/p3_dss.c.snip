@@ -1,0 +1,224 @@
+/* Phase 3 — DSS framing layer tests */
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "../src/dss.h"
+#include "../src/buf.h"
+#include "../include/staticdb2/sdb2.h"
+#include "asserts.h"
+
+
+/*
+ * ---- test 1: RQSDSS round-trip ----
+ * Build a minimal RQSDSS with corrId=1, no chaining, 4 bytes of payload.
+ * Expected wire bytes:
+ *   [00 0A]  length = 6 (hdr) + 4 (payload) = 10
+ *   [D0]     magic
+ *   [01]     format = RQSDSS (0x01), no chain bits
+ *   [00 01]  corrId = 1
+ *   [CA FE BA BE]  payload
+ */
+static void test_rqsdss_basic(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 64) == SDB2_OK);
+
+    CHECK(dss_begin_rqsdss(&b, 1, 0, 0) == SDB2_OK);
+    CHECK(buf_put_u32(&b, 0xCAFEBABEUL) == SDB2_OK);
+    CHECK(dss_finalize(&b) == SDB2_OK);
+
+    CHECK(b.pos == 10);
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x0A);  /* length = 10 */
+    CHECK(b.data[2] == 0xD0);                          /* magic */
+    CHECK(b.data[3] == DSS_FMT_RQSDSS);               /* format = 0x01 */
+    CHECK(b.data[4] == 0x00 && b.data[5] == 0x01);   /* corrId = 1 */
+    CHECK(b.data[6] == 0xCA && b.data[7] == 0xFE);
+    CHECK(b.data[8] == 0xBA && b.data[9] == 0xBE);
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 2: RQSDSS with chaining bits ----
+ * corrId=3, chained=1, same_id=1 → format byte = 0x01|0x40|0x10 = 0x51
+ */
+static void test_rqsdss_chained(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 32) == SDB2_OK);
+
+    CHECK(dss_begin_rqsdss(&b, 3, 1, 1) == SDB2_OK);
+    CHECK(buf_put_u8(&b, 0xFF) == SDB2_OK);
+    CHECK(dss_finalize(&b) == SDB2_OK);
+
+    CHECK(b.data[3] == (DSS_FMT_RQSDSS | DSS_CHAIN | DSS_CHAIN_SAMEID));
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 3: OBJDSS (chained data object) ----
+ * format byte = OBJDSS (0x03), chained=0 → 0x03
+ */
+static void test_objdss(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 32) == SDB2_OK);
+
+    CHECK(dss_begin_objdss(&b, 2, 0, 0) == SDB2_OK);
+    CHECK(buf_put_u8(&b, 0xAB) == SDB2_OK);
+    CHECK(dss_finalize(&b) == SDB2_OK);
+
+    CHECK(b.data[3] == DSS_FMT_OBJDSS);  /* 0x03 */
+    CHECK(b.data[4] == 0x00 && b.data[5] == 0x02);  /* corrId=2 */
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 4: dss_read_header round-trip ----
+ * Write a RQSDSS, flip to read mode, parse header back, check fields.
+ */
+static void test_read_header(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 64) == SDB2_OK);
+
+    CHECK(dss_begin_rqsdss(&b, 7, 1, 0) == SDB2_OK);  /* chained, different id */
+    CHECK(buf_put_u16(&b, 0x1234) == SDB2_OK);
+    CHECK(dss_finalize(&b) == SDB2_OK);
+
+    buf_flip(&b);
+
+    dss_hdr_t hdr;
+    CHECK(dss_read_header(&b, &hdr) == SDB2_OK);
+    CHECK(hdr.corr_id     == 7);
+    CHECK(hdr.chained     == 1);
+    CHECK(hdr.same_id     == 0);
+    CHECK(hdr.continued   == 0);
+    CHECK(hdr.payload_len == 2);  /* 8 total - 6 hdr = 2 payload bytes */
+
+    /* remaining bytes should be the payload */
+    CHECK(buf_remaining(&b) == 2);
+    uint16_t v;
+    CHECK(buf_get_u16(&b, &v) == SDB2_OK && v == 0x1234);
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 5: OBJDSS header round-trip ----
+ */
+static void test_read_objdss_header(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 32) == SDB2_OK);
+
+    CHECK(dss_begin_objdss(&b, 5, 1, 1) == SDB2_OK);
+    CHECK(buf_put_u8(&b, 0x42) == SDB2_OK);
+    CHECK(dss_finalize(&b) == SDB2_OK);
+
+    buf_flip(&b);
+
+    dss_hdr_t hdr;
+    CHECK(dss_read_header(&b, &hdr) == SDB2_OK);
+    CHECK(hdr.corr_id   == 5);
+    CHECK(hdr.chained   == 1);
+    CHECK(hdr.same_id   == 1);
+    CHECK(hdr.continued == 0);
+    CHECK((hdr.fmt & 0x0F) == DSS_FMT_OBJDSS);
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 6: bad magic → SDB2_ERR_PROTO ----
+ */
+static void test_bad_magic(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 16) == SDB2_OK);
+
+    /* Manually craft a DSS header with wrong magic byte */
+    CHECK(buf_put_u16(&b, 0x000A) == SDB2_OK); /* length */
+    CHECK(buf_put_u8(&b, 0xBB)   == SDB2_OK);  /* wrong magic (should be 0xD0) */
+    CHECK(buf_put_u8(&b, 0x01)   == SDB2_OK);  /* format */
+    CHECK(buf_put_u16(&b, 0x0001) == SDB2_OK); /* corrId */
+    CHECK(buf_put_u32(&b, 0)     == SDB2_OK);  /* payload */
+
+    buf_flip(&b);
+
+    dss_hdr_t hdr;
+    CHECK(dss_read_header(&b, &hdr) == SDB2_ERR_PROTO);
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 7: continuation flag (length MSB set = 0x8000) ----
+ */
+static void test_continuation_flag(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 16) == SDB2_OK);
+
+    /* Craft a continuation segment: length = 0xFFFF (MSB set → 32767) */
+    CHECK(buf_put_u16(&b, 0xFFFF) == SDB2_OK);
+    CHECK(buf_put_u8(&b, 0xD0)   == SDB2_OK);
+    CHECK(buf_put_u8(&b, 0x01)   == SDB2_OK);
+    CHECK(buf_put_u16(&b, 0x0001) == SDB2_OK);
+
+    buf_flip(&b);
+
+    dss_hdr_t hdr;
+    CHECK(dss_read_header(&b, &hdr) == SDB2_OK);
+    CHECK(hdr.continued   == 1);
+    CHECK(hdr.payload_len == DSS_MAX_LEN - DSS_HDR_LEN);  /* 32761 */
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 8: two chained DSS frames in sequence ----
+ * RQSDSS(corrId=1, chained) → OBJDSS(corrId=1, not chained)
+ * Verify byte layout of both headers.
+ */
+static void test_two_chained_dss(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 64) == SDB2_OK);
+
+    /* First DSS: chained, same id */
+    CHECK(dss_begin_rqsdss(&b, 1, 1, 1) == SDB2_OK);
+    CHECK(buf_put_u8(&b, 0x11) == SDB2_OK);
+    CHECK(dss_finalize(&b) == SDB2_OK);
+
+    /* Second DSS: not chained */
+    CHECK(dss_begin_objdss(&b, 1, 0, 0) == SDB2_OK);
+    CHECK(buf_put_u8(&b, 0x22) == SDB2_OK);
+    CHECK(dss_finalize(&b) == SDB2_OK);
+
+    CHECK(b.pos == 14);  /* 2 * (6 hdr + 1 payload) = 14 */
+
+    /* First DSS header */
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x07);   /* len=7 */
+    CHECK(b.data[2] == 0xD0);
+    CHECK(b.data[3] == (DSS_FMT_RQSDSS | DSS_CHAIN | DSS_CHAIN_SAMEID));
+    CHECK(b.data[4] == 0x00 && b.data[5] == 0x01);   /* corrId=1 */
+    CHECK(b.data[6] == 0x11);
+
+    /* Second DSS header */
+    CHECK(b.data[7]  == 0x00 && b.data[8]  == 0x07); /* len=7 */
+    CHECK(b.data[9]  == 0xD0);
+    CHECK(b.data[10] == DSS_FMT_OBJDSS);
+    CHECK(b.data[11] == 0x00 && b.data[12] == 0x01); /* corrId=1 */
+    CHECK(b.data[13] == 0x22);
+
+    buf_free(&b);
+}
+
+int main(void) {
+    test_rqsdss_basic();
+    test_rqsdss_chained();
+    test_objdss();
+    test_read_header();
+    test_read_objdss_header();
+    test_bad_magic();
+    test_continuation_flag();
+    test_two_chained_dss();
+
+    print_results("p3_dss");
+    return 0;
+}

@@ -1,0 +1,230 @@
+/* Phase 7 — FD:OCA descriptor parsing tests
+ *
+ * Hand-builds QRYDSC FD:OCA triplet payloads and verifies fdoca_parse_qrydsc
+ * populates fdoca_result_t correctly.
+ *
+ * QRYDSC fixture wire format (FD:OCA, SQLDTAGRP):
+ *   [07 78 00 05 02 01 D0]           MDD triplet (7 bytes)
+ *   [len 76 D0 <col...>]             NGDA triplet (id=D0, 3 bytes per col)
+ *   [06 71 F0 E0 00 00]              RLO end triplet
+ *
+ * Each column entry in NGDA payload: [drda_type(1)][length_hi(1)][length_lo(1)]
+ *   NINTEGER   = 0x03 (nullable INTEGER)     length = 0x0004
+ *   NVARCHAR   = 0x33 (nullable VARCHAR)     length = 0x0064 (max 100)
+ *   NSMALL     = 0x05 (nullable SMALLINT)    length = 0x0002
+ *   NINTEGER8  = 0x17 (nullable BIGINT)      length = 0x0008
+ *   NDECIMAL   = 0x0F (nullable DECIMAL)     length = 0x0010 (16 = packed BCD)
+ *   NDATE      = 0x21 (nullable DATE)        length = 0x000A
+ *   NTIME      = 0x23 (nullable TIME)        length = 0x0008
+ *   NTIMESTAMP = 0x25 (nullable TIMESTAMP)   length = 0x001A
+ *   NCHAR      = 0x31 (nullable CHAR)        length = 0x000A (max 10)
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+
+#include "buf.h"
+#include "fdoca.h"
+#include "asserts.h"
+
+
+/* Build a minimal QRYDSC FD:OCA payload into buf:
+ *   MDD(7) + NGDA(3 + ncols*3) + RLO(6)
+ * Returns total payload length written.
+ */
+static size_t build_qrydsc(buf_t *b, uint8_t *col_types, uint16_t *col_lens, int ncols) {
+    /* MDD: 07 78 00 05 02 01 D0 */
+    static const uint8_t mdd[] = { 0x07, 0x78, 0x00, 0x05, 0x02, 0x01, 0xD0 };
+    buf_put_bytes(b, mdd, 7);
+
+    /* NGDA: [len][76][D0][col entries...] */
+    uint8_t ngda_len = (uint8_t)(3 + ncols * 3);
+    buf_put_u8(b, ngda_len);
+    buf_put_u8(b, 0x76);   /* TRIP_NGDA */
+    buf_put_u8(b, 0xD0);   /* LID_SQLDTAGRP */
+    for (int i = 0; i < ncols; i++) {
+        buf_put_u8(b, col_types[i]);
+        buf_put_u16(b, col_lens[i]);
+    }
+
+    /* RLO end: 06 71 F0 E0 00 00 */
+    static const uint8_t rlo[] = { 0x06, 0x71, 0xF0, 0xE0, 0x00, 0x00 };
+    buf_put_bytes(b, rlo, 6);
+
+    return (size_t)(7 + ngda_len + 6);
+}
+
+/* ---- Test 1: Single INTEGER NOT NULL column ---- */
+static void test_single_int(void) {
+    buf_t b;
+    buf_init(&b, 64);
+
+    uint8_t  types[] = { 0x02 };  /* DRDA_TYPE_INTEGER (not nullable) */
+    uint16_t lens[]  = { 4 };
+    size_t payload_len = build_qrydsc(&b, types, lens, 1);
+    buf_flip(&b);
+
+    fdoca_result_t r;
+    int rc = fdoca_parse_qrydsc(&b, payload_len, &r);
+    CHECK(rc == SDB2_OK);
+    CHECK(r.ncols == 1);
+    CHECK(r.cols[0].drda_type == 0x02);
+    CHECK(r.cols[0].length == 4);
+    CHECK(r.cols[0].nullable == 0);
+    CHECK(r.cols[0].sdb2_type == SDB2_C_INT32);
+
+    fdoca_result_free(&r);
+    buf_free(&b);
+}
+
+/* ---- Test 2: Nullable INTEGER and nullable VARCHAR(100) ---- */
+static void test_int_and_varchar(void) {
+    buf_t b;
+    buf_init(&b, 128);
+
+    uint8_t  types[] = { 0x03, 0x33 };  /* NINTEGER, NVARCHAR */
+    uint16_t lens[]  = { 4, 100 };
+    size_t payload_len = build_qrydsc(&b, types, lens, 2);
+    buf_flip(&b);
+
+    fdoca_result_t r;
+    int rc = fdoca_parse_qrydsc(&b, payload_len, &r);
+    CHECK(rc == SDB2_OK);
+    CHECK(r.ncols == 2);
+
+    CHECK(r.cols[0].drda_type == 0x03);
+    CHECK(r.cols[0].nullable == 1);
+    CHECK(r.cols[0].sdb2_type == SDB2_C_INT32);
+    CHECK(r.cols[0].length == 4);
+
+    CHECK(r.cols[1].drda_type == 0x33);
+    CHECK(r.cols[1].nullable == 1);
+    CHECK(r.cols[1].sdb2_type == SDB2_C_VARCHAR);
+    CHECK(r.cols[1].length == 100);
+
+    fdoca_result_free(&r);
+    buf_free(&b);
+}
+
+/* ---- Test 3: All core nullable types ---- */
+static void test_all_types(void) {
+    buf_t b;
+    buf_init(&b, 256);
+
+    uint8_t  types[] = {
+        0x05,  /* NSMALL */
+        0x03,  /* NINTEGER */
+        0x17,  /* NINTEGER8 */
+        0x0D,  /* NFLOAT4 */
+        0x0B,  /* NFLOAT8 */
+        0x0F,  /* NDECIMAL — [precision=7][scale=2] = 0x0702 */
+        0x21,  /* NDATE */
+        0x23,  /* NTIME */
+        0x25,  /* NTIMESTAMP */
+        0x31,  /* NCHAR */
+        0x33,  /* NVARCHAR */
+        0x29,  /* NVARBYTE */
+        0xBF,  /* NBOOLEAN */
+    };
+    uint16_t lens[] = { 2, 4, 8, 4, 8, (7u<<8)|2u, 10, 8, 26, 10, 100, 50, 1 };
+    int ncols = (int)(sizeof(types) / sizeof(types[0]));
+    size_t payload_len = build_qrydsc(&b, types, lens, ncols);
+    buf_flip(&b);
+
+    fdoca_result_t r;
+    int rc = fdoca_parse_qrydsc(&b, payload_len, &r);
+    CHECK(rc == SDB2_OK);
+    CHECK(r.ncols == ncols);
+
+    /* spot-check a few */
+    CHECK(r.cols[0].sdb2_type == SDB2_C_INT16);      /* NSMALL */
+    CHECK(r.cols[2].sdb2_type == SDB2_C_INT64);      /* NINTEGER8 */
+    CHECK(r.cols[3].sdb2_type == SDB2_C_FLOAT32);    /* NFLOAT4 */
+    CHECK(r.cols[4].sdb2_type == SDB2_C_FLOAT64);    /* NFLOAT8 */
+    CHECK(r.cols[5].sdb2_type == SDB2_C_DECIMAL);    /* NDECIMAL */
+    CHECK(r.cols[5].precision == 7);
+    CHECK(r.cols[5].scale     == 2);
+    CHECK(r.cols[5].length    == 4);                 /* packed-BCD bytes = ceil((7+1)/2) */
+    CHECK(r.cols[6].sdb2_type == SDB2_C_DATE);       /* NDATE */
+    CHECK(r.cols[7].sdb2_type == SDB2_C_TIME);       /* NTIME */
+    CHECK(r.cols[8].sdb2_type == SDB2_C_TIMESTAMP);  /* NTIMESTAMP */
+    CHECK(r.cols[9].sdb2_type == SDB2_C_CHAR);       /* NCHAR */
+    CHECK(r.cols[10].sdb2_type == SDB2_C_VARCHAR);   /* NVARCHAR */
+    CHECK(r.cols[11].sdb2_type == SDB2_C_VARBINARY); /* NVARBYTE */
+    CHECK(r.cols[12].sdb2_type == SDB2_C_BOOL);      /* NBOOLEAN */
+
+    /* all should be nullable */
+    for (int i = 0; i < ncols; i++) {
+        CHECK(r.cols[i].nullable == 1);
+    }
+
+    fdoca_result_free(&r);
+    buf_free(&b);
+}
+
+/* ---- Test 4: SDA triplet is present but skipped without error ---- */
+static void test_with_sda_triplet(void) {
+    buf_t b;
+    buf_init(&b, 256);
+
+    /* MDD */
+    static const uint8_t mdd[] = { 0x07, 0x78, 0x00, 0x05, 0x02, 0x01, 0xD0 };
+    buf_put_bytes(&b, mdd, 7);
+
+    /* SDA (12 bytes total): [0C 70 33 ...9 bytes payload...] */
+    uint8_t sda[12] = { 0x0C, 0x70, 0x33, 0,0,0,0,0,0,0,0,0 };
+    buf_put_bytes(&b, sda, 12);
+
+    /* NGDA with one NVARCHAR */
+    uint8_t  types[] = { 0x33 };
+    uint16_t lens[]  = { 50 };
+    uint8_t ngda_len = 6;
+    buf_put_u8(&b, ngda_len);
+    buf_put_u8(&b, 0x76);
+    buf_put_u8(&b, 0xD0);
+    buf_put_u8(&b, types[0]);
+    buf_put_u16(&b, lens[0]);
+
+    /* RLO end */
+    static const uint8_t rlo[] = { 0x06, 0x71, 0xF0, 0xE0, 0x00, 0x00 };
+    buf_put_bytes(&b, rlo, 6);
+
+    size_t payload_len = 7 + 12 + 6 + 6;
+    buf_flip(&b);
+
+    fdoca_result_t r;
+    int rc = fdoca_parse_qrydsc(&b, payload_len, &r);
+    CHECK(rc == SDB2_OK);
+    CHECK(r.ncols == 1);
+    CHECK(r.cols[0].sdb2_type == SDB2_C_VARCHAR);
+
+    fdoca_result_free(&r);
+    buf_free(&b);
+}
+
+/* ---- Test 5: fdoca_drda_to_sdb2 boundary cases ---- */
+static void test_type_mapping(void) {
+    CHECK(fdoca_drda_to_sdb2(0x02) == SDB2_C_INT32);   /* INTEGER not nullable */
+    CHECK(fdoca_drda_to_sdb2(0x03) == SDB2_C_INT32);   /* nullable */
+    CHECK(fdoca_drda_to_sdb2(0x30) == SDB2_C_CHAR);
+    CHECK(fdoca_drda_to_sdb2(0x31) == SDB2_C_CHAR);
+    CHECK(fdoca_drda_to_sdb2(0xC8) == SDB2_C_BLOB);
+    CHECK(fdoca_drda_to_sdb2(0xC9) == SDB2_C_BLOB);
+    CHECK(fdoca_drda_to_sdb2(0xCA) == SDB2_C_CLOB);
+    CHECK(fdoca_drda_to_sdb2(0xCB) == SDB2_C_CLOB);
+    CHECK(fdoca_drda_to_sdb2(0xBE) == SDB2_C_BOOL);
+    CHECK(fdoca_drda_to_sdb2(0xBF) == SDB2_C_BOOL);
+    CHECK(fdoca_drda_to_sdb2(0xFF) == SDB2_C_UNKNOWN);  /* unknown type */
+}
+
+int main(void) {
+    test_single_int();
+    test_int_and_varchar();
+    test_all_types();
+    test_with_sda_triplet();
+    test_type_mapping();
+
+    print_results("p7_fdoca");
+    return 0;
+}

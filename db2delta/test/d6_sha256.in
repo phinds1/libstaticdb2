@@ -1,0 +1,45 @@
+/* Phase 6 — SHA-256 test vectors */
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "../src/sha256.h"
+
+static int failed = 0;
+static int passed = 0;
+
+#define CHECK_HEX(input, input_len, expected) \
+    do { \
+        char hex[65]; \
+        sha256_hex((const uint8_t *)(input), (input_len), hex); \
+        if (strcmp(hex, (expected)) != 0) { \
+            printf("  FAIL [%d]: sha256(\"%s\") =\n    %s\n  expected:\n    %s\n", \
+                   __LINE__, (input), hex, (expected)); \
+            failed++; \
+        } else { \
+            printf("  PASS: sha256(\"%.*s...\") OK\n", \
+                   (int)((input_len) < 16 ? (input_len) : 16), (input)); \
+            passed++; \
+        } \
+    } while(0)
+
+int main(void) {
+    printf("=== Phase 6 — SHA-256 test vectors ===\n\n");
+
+    /* FIPS 180-4 known vectors */
+    CHECK_HEX("", 0,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+    CHECK_HEX("abc", 3,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+    CHECK_HEX(
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56,
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+
+    /* One more: "The quick brown fox jumps over the lazy dog" */
+    CHECK_HEX("The quick brown fox jumps over the lazy dog", 43,
+        "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592");
+
+    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
+    return failed ? 1 : 0;
+}

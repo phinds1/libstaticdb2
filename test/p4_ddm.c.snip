@@ -1,0 +1,249 @@
+/* Phase 4 — DDM object layer tests */
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "../src/ddm.h"
+#include "../src/buf.h"
+#include "../include/staticdb2/sdb2.h"
+#include "asserts.h"
+
+
+/*
+ * ---- test 1: scalar_u8 ----
+ * ddm_put_scalar_u8(&b, CP_SVRCOD, 0x08)  -- SVRCOD=0x1149
+ * Expected: [00 05] [11 49] [08]
+ */
+static void test_scalar_u8(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 16) == SDB2_OK);
+    CHECK(ddm_put_scalar_u8(&b, CP_SVRCOD, 0x08) == SDB2_OK);
+    CHECK(b.pos == 5);
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x05);
+    CHECK(b.data[2] == 0x11 && b.data[3] == 0x49);
+    CHECK(b.data[4] == 0x08);
+    buf_free(&b);
+}
+
+/*
+ * ---- test 2: scalar_u16 ----
+ * CP_SECMEC = 0x11A2, value = SECMEC_USRIDPWD = 0x0003
+ * Expected: [00 06] [11 A2] [00 03]
+ */
+static void test_scalar_u16(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 16) == SDB2_OK);
+    CHECK(ddm_put_scalar_u16(&b, CP_SECMEC, SECMEC_USRIDPWD) == SDB2_OK);
+    CHECK(b.pos == 6);
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x06);
+    CHECK(b.data[2] == 0x11 && b.data[3] == 0xA2);
+    CHECK(b.data[4] == 0x00 && b.data[5] == 0x03);
+    buf_free(&b);
+}
+
+/*
+ * ---- test 3: scalar_u32 ----
+ * CP_QRYBLKSZ = 0x2114, value = 32767
+ * Expected: [00 08] [21 14] [00 00 7F FF]
+ */
+static void test_scalar_u32(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 16) == SDB2_OK);
+    CHECK(ddm_put_scalar_u32(&b, CP_QRYBLKSZ, 32767UL) == SDB2_OK);
+    CHECK(b.pos == 8);
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x08);
+    CHECK(b.data[2] == 0x21 && b.data[3] == 0x14);
+    CHECK(b.data[4] == 0x00 && b.data[5] == 0x00);
+    CHECK(b.data[6] == 0x7F && b.data[7] == 0xFF);
+    buf_free(&b);
+}
+
+/*
+ * ---- test 4: scalar_u64 ----
+ * Expected: [00 0C] [cp_hi cp_lo] [8 bytes]
+ */
+static void test_scalar_u64(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 16) == SDB2_OK);
+    CHECK(ddm_put_scalar_u64(&b, 0xABCDu, 0x0102030405060708ULL) == SDB2_OK);
+    CHECK(b.pos == 12);
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x0C);
+    CHECK(b.data[2] == 0xAB && b.data[3] == 0xCD);
+    CHECK(b.data[4] == 0x01 && b.data[11] == 0x08);
+    buf_free(&b);
+}
+
+/*
+ * ---- test 5: scalar_bytes ----
+ * CP_EXTNAM = 0x115E, data = "TESTAPP" (7 bytes)
+ * Expected: [00 0B] [11 5E] [54 45 53 54 41 50 50]
+ *   total = 4 + 7 = 11 = 0x000B
+ */
+static void test_scalar_bytes(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 32) == SDB2_OK);
+    const char *app = "TESTAPP";
+    CHECK(ddm_put_scalar_bytes(&b, CP_EXTNAM,
+                                (const uint8_t *)app, strlen(app)) == SDB2_OK);
+    CHECK(b.pos == 11);
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x0B);
+    CHECK(b.data[2] == 0x11 && b.data[3] == 0x5E);
+    CHECK(memcmp(b.data + 4, app, 7) == 0);
+    buf_free(&b);
+}
+
+/*
+ * ---- test 6: scalar_string (EBCDIC-encoded RDBNAM) ----
+ * CP_RDBNAM = 0x2110, value = "SAMPLE" in EBCDIC
+ * EBCDIC "SAMPLE" = { E2 C1 D4 D7 D3 C5 } (verified in Phase 2)
+ * total = 4 + 6 = 10 = 0x000A
+ */
+static void test_scalar_string_ebcdic(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 32) == SDB2_OK);
+    CHECK(ddm_put_scalar_string(&b, CP_RDBNAM, CCSID_EBCDIC, "SAMPLE") > 0);
+    CHECK(b.pos == 10);
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x0A);
+    CHECK(b.data[2] == 0x21 && b.data[3] == 0x10);
+    CHECK(b.data[4] == 0xE2 && b.data[5] == 0xC1);
+    CHECK(b.data[6] == 0xD4 && b.data[7] == 0xD7);
+    CHECK(b.data[8] == 0xD3 && b.data[9] == 0xC5);
+    buf_free(&b);
+}
+
+/*
+ * ---- test 7: collection (nested DDM object) ----
+ * Encode a minimal EXCSAT-like structure:
+ *   begin_collection(CP_EXCSAT)
+ *     scalar_u8(CP_SVRCOD, 0)
+ *   end_collection
+ *
+ * Expected bytes:
+ *   [00 09] [10 41]          — EXCSAT length=9, cp=0x1041
+ *   [00 05] [11 49] [00]     — SVRCOD length=5, cp=0x1149, value=0
+ */
+static void test_collection(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 32) == SDB2_OK);
+
+    CHECK(ddm_begin_collection(&b, CP_EXCSAT) == SDB2_OK);
+        CHECK(ddm_put_scalar_u8(&b, CP_SVRCOD, 0) == SDB2_OK);
+    CHECK(ddm_end_collection(&b) == SDB2_OK);
+
+    CHECK(b.pos == 9);
+    /* EXCSAT header: length=9 */
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x09);
+    CHECK(b.data[2] == 0x10 && b.data[3] == 0x41);
+    /* SVRCOD scalar: length=5 */
+    CHECK(b.data[4] == 0x00 && b.data[5] == 0x05);
+    CHECK(b.data[6] == 0x11 && b.data[7] == 0x49);
+    CHECK(b.data[8] == 0x00);
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 8: nested collections ----
+ * Outer collection wraps an inner collection plus a scalar.
+ */
+static void test_nested_collections(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 64) == SDB2_OK);
+
+    CHECK(ddm_begin_collection(&b, 0x1000u) == SDB2_OK);  /* outer */
+        CHECK(ddm_begin_collection(&b, 0x2000u) == SDB2_OK); /* inner */
+            CHECK(ddm_put_scalar_u8(&b, 0x3000u, 0x42) == SDB2_OK);
+        CHECK(ddm_end_collection(&b) == SDB2_OK);
+        CHECK(ddm_put_scalar_u16(&b, 0x4000u, 0xABCDu) == SDB2_OK);
+    CHECK(ddm_end_collection(&b) == SDB2_OK);
+
+    /* inner: 4 + 5 = 9 bytes;  outer: 4 + 9 + 6 = 19 bytes */
+    CHECK(b.pos == 19);
+
+    /* outer length=19 */
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x13);
+
+    /* inner offset=4, length=9 */
+    CHECK(b.data[4] == 0x00 && b.data[5] == 0x09);
+
+    /* scalar u16 at offset=13, length=6 */
+    CHECK(b.data[13] == 0x00 && b.data[14] == 0x06);
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 9: ddm_read_hdr round-trip ----
+ */
+static void test_read_hdr(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 32) == SDB2_OK);
+
+    CHECK(ddm_put_scalar_u16(&b, CP_SECMEC, 0x0003u) == SDB2_OK);
+
+    buf_flip(&b);
+
+    ddm_hdr_t hdr;
+    CHECK(ddm_read_hdr(&b, &hdr) == SDB2_OK);
+    CHECK(hdr.cp  == CP_SECMEC);
+    CHECK(hdr.len == 6);  /* total including 4-byte header */
+    CHECK(buf_remaining(&b) == 2);  /* 2 payload bytes left */
+
+    uint16_t val;
+    CHECK(buf_get_u16(&b, &val) == SDB2_OK && val == 0x0003u);
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 10: ddm_skip_payload ----
+ */
+static void test_skip_payload(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 32) == SDB2_OK);
+
+    CHECK(ddm_put_scalar_u32(&b, 0xAAAAu, 0xDEADBEEFUL) == SDB2_OK);
+    CHECK(ddm_put_scalar_u8(&b,  0xBBBBu, 0x42)          == SDB2_OK);
+
+    buf_flip(&b);
+
+    ddm_hdr_t hdr;
+    CHECK(ddm_read_hdr(&b, &hdr) == SDB2_OK);
+    CHECK(hdr.cp == 0xAAAAu);
+    CHECK(ddm_skip_payload(&b, &hdr) == SDB2_OK);
+
+    /* Now positioned at the second object */
+    CHECK(ddm_read_hdr(&b, &hdr) == SDB2_OK);
+    CHECK(hdr.cp == 0xBBBBu);
+
+    buf_free(&b);
+}
+
+/*
+ * ---- test 11: ddm_cp_name ----
+ */
+static void test_cp_name(void) {
+    CHECK(strcmp(ddm_cp_name(CP_EXCSAT),    "EXCSAT")    == 0);
+    CHECK(strcmp(ddm_cp_name(CP_SQLCARD),   "SQLCARD")   == 0);
+    CHECK(strcmp(ddm_cp_name(CP_ACCRDBRM),  "ACCRDBRM")  == 0);
+    CHECK(strcmp(ddm_cp_name(CP_MGRLVLLS),  "MGRLVLLS")  == 0);
+    /* Unknown codepoint should return a hex string */
+    const char *unknown = ddm_cp_name(0xFFFEu);
+    CHECK(unknown[0] == '0' && unknown[1] == 'x');
+}
+
+int main(void) {
+    test_scalar_u8();
+    test_scalar_u16();
+    test_scalar_u32();
+    test_scalar_u64();
+    test_scalar_bytes();
+    test_scalar_string_ebcdic();
+    test_collection();
+    test_nested_collections();
+    test_read_hdr();
+    test_skip_payload();
+    test_cp_name();
+
+    print_results("p4_ddm");
+    return 0;
+}

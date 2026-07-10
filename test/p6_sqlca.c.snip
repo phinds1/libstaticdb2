@@ -1,0 +1,217 @@
+/* Phase 6 — SQLCA parsing tests
+ *
+ * Tests the SQLCAGRP FD:OCA parser in sqlca.[ch].
+ *
+ * Fixture layout (SQLAM=7):
+ *   null_ind(1) sqlcode(4 LE) sqlstate(5) sqlerrproc(8)
+ *   caxgrp_null_ind(1) sqlerrd[6](24 LE I4) sqlwarn(11)
+ *   rdbname_vcs_len(2 BE) rdbname_bytes
+ *   sqlerrmc_vcm_len(2 BE) sqlerrmc_bytes
+ *   sqlerrmc_vcs_len(2 BE) [empty]
+ *   diaggrp_null_ind(1)=0xFF
+ *
+ * SQLCODE and SQLERRD I4 values are little-endian (QTDSQLASC application data).
+ * VCS/VCM length prefixes are big-endian (DDM protocol level).
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+
+#include "buf.h"
+#include "sqlca.h"
+#include "asserts.h"
+
+
+/* ---- helpers — little-endian (QTDSQLASC wire format) ---- */
+
+static void put_i32(uint8_t *p, int32_t v) {
+    p[0] = (v >>  0) & 0xFF;
+    p[1] = (v >>  8) & 0xFF;
+    p[2] = (v >> 16) & 0xFF;
+    p[3] = (v >> 24) & 0xFF;
+}
+
+static void put_u16(uint8_t *p, uint16_t v) {
+    p[0] = (v >> 8) & 0xFF;
+    p[1] = (v >> 0) & 0xFF;
+}
+
+/* ---- Test 1: NULLDATA (0xFF) → has_sqlca == 0, returns SDB2_OK ---- */
+static void test_null_sqlca(void) {
+    uint8_t raw[1] = { 0xFF };
+    buf_t b;
+    buf_init(&b, 16);
+    buf_put_bytes(&b, raw, 1);
+    buf_flip(&b);
+
+    sdb2_sqlca_t ca;
+    int rc = sqlca_parse(&b, &ca);
+    CHECK(rc == SDB2_OK);
+    CHECK(ca.has_sqlca == 0);
+    CHECK(ca.sqlcode == 0);
+
+    buf_free(&b);
+}
+
+/* ---- Test 2: SQLCODE -204, SQLSTATE "42704", no CAXGRP ---- */
+static void test_error_no_caxgrp(void) {
+    uint8_t raw[64];
+    int pos = 0;
+
+    /* null_ind = not null */
+    raw[pos++] = 0x01;
+    /* sqlcode = -204 */
+    put_i32(raw + pos, -204); pos += 4;
+    /* sqlstate = "42704" (5 bytes, no NUL on wire) */
+    memcpy(raw + pos, "42704", 5); pos += 5;
+    /* sqlerrproc = "SYSIBM  " (8 bytes) */
+    memcpy(raw + pos, "SYSIBM  ", 8); pos += 8;
+    /* SQLCAXGRP null_ind = NULLDATA */
+    raw[pos++] = 0xFF;
+    /* SQLDIAGGRP null_ind = NULLDATA */
+    raw[pos++] = 0xFF;
+
+    buf_t b;
+    buf_init(&b, 64);
+    buf_put_bytes(&b, raw, (size_t)pos);
+    buf_flip(&b);
+
+    sdb2_sqlca_t ca;
+    int rc = sqlca_parse(&b, &ca);
+    CHECK(rc == SDB2_OK);
+    CHECK(ca.has_sqlca == 1);
+    CHECK(ca.sqlcode == -204);
+    CHECK(memcmp(ca.sqlstate, "42704", 5) == 0);
+    CHECK(ca.has_caxgrp == 0);
+
+    buf_free(&b);
+}
+
+/* ---- Test 3: SQLCODE -204, SQLSTATE "42704", with CAXGRP and errmsg ---- */
+static void test_error_with_caxgrp(void) {
+    uint8_t raw[256];
+    int pos = 0;
+
+    /* null_ind = not null */
+    raw[pos++] = 0x01;
+    /* sqlcode = -204 */
+    put_i32(raw + pos, -204); pos += 4;
+    /* sqlstate = "42704" */
+    memcpy(raw + pos, "42704", 5); pos += 5;
+    /* sqlerrproc = "SYSIBM  " */
+    memcpy(raw + pos, "SYSIBM  ", 8); pos += 8;
+
+    /* SQLCAXGRP null_ind = not null */
+    raw[pos++] = 0x01;
+
+    /* sqlerrd[0..5]: e.g. [-204, 0, 0, 0, 0, 0] */
+    put_i32(raw + pos, -204); pos += 4;
+    for (int i = 1; i < 6; i++) { put_i32(raw + pos, 0); pos += 4; }
+
+    /* sqlwarn[0..10]: 11 bytes, all spaces */
+    memset(raw + pos, ' ', 11); pos += 11;
+
+    /* SQLRDBNAME VCS: length=6, "SAMPLE" */
+    put_u16(raw + pos, 6); pos += 2;
+    memcpy(raw + pos, "SAMPLE", 6); pos += 6;
+
+    /* SQLERRMC_m VCM: length=0 (empty) */
+    put_u16(raw + pos, 0); pos += 2;
+
+    /* SQLERRMC_s VCS: length=7, "MYTABLE" */
+    put_u16(raw + pos, 7); pos += 2;
+    memcpy(raw + pos, "MYTABLE", 7); pos += 7;
+
+    /* SQLDIAGGRP: NULLDATA */
+    raw[pos++] = 0xFF;
+
+    buf_t b;
+    buf_init(&b, 256);
+    buf_put_bytes(&b, raw, (size_t)pos);
+    buf_flip(&b);
+
+    sdb2_sqlca_t ca;
+    int rc = sqlca_parse(&b, &ca);
+    CHECK(rc == SDB2_OK);
+    CHECK(ca.has_sqlca == 1);
+    CHECK(ca.sqlcode == -204);
+    CHECK(memcmp(ca.sqlstate, "42704", 5) == 0);
+    CHECK(ca.has_caxgrp == 1);
+    CHECK(ca.sqlerrd[0] == -204);
+    CHECK(ca.sqlerrd[1] == 0);
+    /* errmsg should contain "MYTABLE" (from VCS path) */
+    CHECK(ca.errmsg_len == 7);
+    CHECK(memcmp(ca.errmsg, "MYTABLE", 7) == 0);
+
+    buf_free(&b);
+}
+
+/* ---- Test 4: Success SQLCODE 0, CAXGRP present ---- */
+static void test_success_with_caxgrp(void) {
+    uint8_t raw[128];
+    int pos = 0;
+
+    raw[pos++] = 0x01;
+    put_i32(raw + pos, 0); pos += 4;
+    memcpy(raw + pos, "00000", 5); pos += 5;
+    memcpy(raw + pos, "        ", 8); pos += 8;
+
+    raw[pos++] = 0x01; /* SQLCAXGRP not null */
+    for (int i = 0; i < 6; i++) { put_i32(raw + pos, 0); pos += 4; }
+    memset(raw + pos, ' ', 11); pos += 11;
+
+    /* SQLRDBNAME VCS: empty */
+    put_u16(raw + pos, 0); pos += 2;
+
+    /* SQLERRMC_m VCM: length=4 "DONE" (use VCM path) */
+    put_u16(raw + pos, 4); pos += 2;
+    memcpy(raw + pos, "DONE", 4); pos += 4;
+    /* SQLERRMC_s VCS: must still be present — length=0 */
+    put_u16(raw + pos, 0); pos += 2;
+
+    raw[pos++] = 0xFF; /* SQLDIAGGRP null */
+
+    buf_t b;
+    buf_init(&b, 128);
+    buf_put_bytes(&b, raw, (size_t)pos);
+    buf_flip(&b);
+
+    sdb2_sqlca_t ca;
+    int rc = sqlca_parse(&b, &ca);
+    CHECK(rc == SDB2_OK);
+    CHECK(ca.has_sqlca == 1);
+    CHECK(ca.sqlcode == 0);
+    CHECK(ca.has_caxgrp == 1);
+    CHECK(ca.errmsg_len == 4);
+    CHECK(memcmp(ca.errmsg, "DONE", 4) == 0);
+
+    buf_free(&b);
+}
+
+/* ---- Test 5: Underflow → SDB2_NEED_MORE ---- */
+static void test_underflow(void) {
+    /* Only 3 bytes in — not enough for sqlcode after null_ind */
+    uint8_t raw[4] = { 0x01, 0x00, 0x00 };
+    buf_t b;
+    buf_init(&b, 8);
+    buf_put_bytes(&b, raw, 3);
+    buf_flip(&b);
+
+    sdb2_sqlca_t ca;
+    int rc = sqlca_parse(&b, &ca);
+    CHECK(rc == SDB2_NEED_MORE);
+
+    buf_free(&b);
+}
+
+int main(void) {
+    test_null_sqlca();
+    test_error_no_caxgrp();
+    test_error_with_caxgrp();
+    test_success_with_caxgrp();
+    test_underflow();
+
+    print_results("p6_sqlca");
+    return 0;
+}

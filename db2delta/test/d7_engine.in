@@ -1,0 +1,42 @@
+/* Phase 7 — engine decision logic unit test (no DB) */
+#include <stdio.h>
+#include "../src/engine.h"
+
+static int failed = 0;
+static int passed = 0;
+
+#define CHECK_DEC(present, stmt_fail, cont, expected) \
+    do { \
+        engine_decision_t d = engine_decide((present),(stmt_fail),(cont)); \
+        if (d != (expected)) { \
+            printf("  FAIL [%d]: engine_decide(%d,%d,%d)=%d expected %d\n", \
+                   __LINE__, present, stmt_fail, cont, (int)d, (int)(expected)); \
+            failed++; \
+        } else { passed++; } \
+    } while(0)
+
+int main(void) {
+    printf("=== Phase 7 — engine_decide truth table ===\n\n");
+
+    /* already present → always skip */
+    printf("  T1-T3: already_present → SKIP regardless of other flags\n");
+    CHECK_DEC(1, 0, 0, ENG_SKIP_PRESENT);
+    CHECK_DEC(1, 1, 0, ENG_SKIP_PRESENT);
+    CHECK_DEC(1, 0, 1, ENG_SKIP_PRESENT);
+
+    /* not present, no failure → record */
+    printf("  T4: not present + ok → APPLY_RECORD\n");
+    CHECK_DEC(0, 0, 0, ENG_APPLY_RECORD);
+    CHECK_DEC(0, 0, 1, ENG_APPLY_RECORD);
+
+    /* not present, failed, fail-fast → STOP */
+    printf("  T5: not present + fail + fail-fast → STOP_FAIL\n");
+    CHECK_DEC(0, 1, 0, ENG_STOP_FAIL);
+
+    /* not present, failed, continue-on-error → CONTINUE */
+    printf("  T6: not present + fail + continue → CONTINUE_FAIL\n");
+    CHECK_DEC(0, 1, 1, ENG_CONTINUE_FAIL);
+
+    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
+    return failed ? 1 : 0;
+}

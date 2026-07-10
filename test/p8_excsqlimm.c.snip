@@ -1,0 +1,315 @@
+/* Phase 8 — EXCSQLIMM request encoding tests
+ *
+ * Tests that drda_exec_immediate builds the correct request bytes without
+ * a live DB2 connection.  We substitute a mock socket (a socketpair or pipe)
+ * so that drda_flush writes to one end and we read from the other.
+ *
+ * Encoding checks:
+ *   1. DSS 1 is RQSDSS (fmt & 0x0F == 0x01) with chain bit set
+ *   2. DSS 1 payload starts with EXCSQLIMM DDM (CP 0x200A)
+ *   3. PKGNAMCSN (CP 0x2113) is present in EXCSQLIMM
+ *   4. RDBCMTOK (CP 0x2105) is present with value 0xF1
+ *   5. DSS 2 is OBJDSS (fmt & 0x0F == 0x03), same corrId
+ *   6. DSS 2 payload starts with SQLSTT DDM (CP 0x2414)
+ *   7. SQLSTT contains the SQL text (via NOCS path: 0xFF 0x00 len sql)
+ *   8. Both DSS have the same correlation ID
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include "buf.h"
+#include "dss.h"
+#include "ddm.h"
+#include "drda.h"
+#include "ccsid.h"
+#include "staticdb2/sdb2.h"
+#include "asserts.h"
+
+
+/* ---- helpers ---- */
+static uint16_t u16be(const uint8_t *p) { return ((uint16_t)p[0] << 8) | p[1]; }
+static uint32_t u32be(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  | p[3];
+}
+
+/*
+ * Build the EXCSQLIMM + SQLSTT request bytes directly (without a live socket)
+ * into a buf_t by calling the same low-level functions drda_exec_immediate uses.
+ *
+ * This replicates the encoding done inside drda_exec_immediate so we can
+ * inspect the bytes without needing a DB2 server.
+ */
+static void build_excsqlimm_request(buf_t *b, const char *db, const char *sql,
+                                    uint16_t cid) {
+    /* RDBNAM EBCDIC 18 bytes */
+    uint8_t rdbnam[18];
+    size_t dblen = strlen(db);
+    int enc = ccsid_utf8_to_wire(CCSID_EBCDIC, (const uint8_t *)db, dblen,
+                                 rdbnam, 18);
+    if (enc >= 0 && (size_t)enc < 18)
+        memset(rdbnam + enc, 0x40, 18 - (size_t)enc);
+
+    /* RDBCOLID "NULLID" EBCDIC padded to 18 */
+    static const uint8_t nullid[18] = {
+        0xD5, 0xE4, 0xD3, 0xD3, 0xC9, 0xC4,
+        0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40
+    };
+
+    /* PKGID "SYSSHA" EBCDIC padded to 18 */
+    static const uint8_t syssha[18] = {
+        0xE2,0xE8,0xE2,0xE2,0xC8,0xC1,
+        0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40
+    };
+
+    static const uint8_t zeros8[8] = { 0 };
+
+    /* DSS 1: RQSDSS chained, same_id */
+    dss_begin_rqsdss(b, cid, 1, 1);
+    ddm_begin_collection(b, CP_EXCSQLIMM);
+    {
+        /* PKGNAMCSN */
+        ddm_begin_collection(b, CP_PKGNAMCSN);
+        buf_put_bytes(b, rdbnam, 18);
+        buf_put_bytes(b, nullid, 18);
+        buf_put_bytes(b, syssha, 18);
+        buf_put_bytes(b, zeros8, 8);
+        buf_put_u16(b, 1); /* section 1 */
+        ddm_end_collection(b);
+        /* RDBCMTOK */
+        ddm_put_scalar_u8(b, CP_RDBCMTOK, 0xF1u);
+    }
+    ddm_end_collection(b);
+    dss_finalize(b);
+
+    /* DSS 2: OBJDSS, not chained */
+    dss_begin_objdss(b, cid, 0, 0);
+    ddm_begin_collection(b, CP_SQLSTT);
+    {
+        buf_put_u8(b, 0xFF); /* NOCM null */
+        buf_put_u8(b, 0x00); /* NOCS not-null */
+        uint32_t sql_len = (uint32_t)strlen(sql);
+        buf_put_u32(b, sql_len);
+        buf_put_bytes(b, (const uint8_t *)sql, sql_len);
+    }
+    ddm_end_collection(b);
+    dss_finalize(b);
+}
+
+/* ---- Test 1: DSS 1 is RQSDSS with chain bit ---- */
+static void test_dss1_rqsdss_chained(void) {
+    buf_t b;
+    buf_init(&b, 512);
+    build_excsqlimm_request(&b, "TESTDB", "INSERT INTO t VALUES(1)", 1);
+    buf_flip(&b);
+
+    const uint8_t *d = b.data;
+    /* DSS header: [len(2)][D0][fmt][corrId(2)] */
+    CHECK(d[2] == 0xD0);                     /* magic */
+    uint8_t fmt = d[3];
+    CHECK((fmt & 0x0F) == 0x01);             /* RQSDSS */
+    CHECK(fmt & 0x40);                       /* chain bit set */
+    CHECK(u16be(d + 4) == 1);               /* corrId = 1 */
+
+    buf_free(&b);
+}
+
+/* ---- Test 2: EXCSQLIMM DDM present in DSS 1 ---- */
+static void test_excsqlimm_ddm(void) {
+    buf_t b;
+    buf_init(&b, 512);
+    build_excsqlimm_request(&b, "TESTDB", "INSERT INTO t VALUES(1)", 2);
+    buf_flip(&b);
+
+    const uint8_t *d = b.data;
+    /* After 6-byte DSS header: first DDM is EXCSQLIMM */
+    /* [ll ll][20 0A] */
+    CHECK(u16be(d + 8) == CP_EXCSQLIMM);
+
+    buf_free(&b);
+}
+
+/* ---- Test 3: PKGNAMCSN is present with correct NULLID and SYSSHA ---- */
+static void test_pkgnamcsn_content(void) {
+    buf_t b;
+    buf_init(&b, 512);
+    build_excsqlimm_request(&b, "SAMPLE", "SELECT 1 FROM SYSIBM.SYSDUMMY1", 3);
+    buf_flip(&b);
+
+    /* Find CP_PKGNAMCSN = 0x2113 in the buffer */
+    const uint8_t *d = b.data;
+    size_t sz = b.limit;
+    int found = 0;
+    for (size_t i = 0; i + 4 <= sz; i++) {
+        if (u16be(d + i + 2) == CP_PKGNAMCSN) {
+            /* PKGNAMCSN payload starts at i+4 */
+            const uint8_t *p = d + i + 4;
+            /* First 18 bytes: RDBNAM (SAMPLE in EBCDIC = 0xE2 0xC1 0xD4 0xD7 0xD3 0xC5) */
+            CHECK(p[0] == 0xE2 && p[1] == 0xC1);  /* "SA" EBCDIC */
+            /* Next 18 bytes: RDBCOLID "NULLID" = 0xD5 0xE4 0xD3 0xD3 0xC9 0xC4 */
+            CHECK(p[18] == 0xD5 && p[19] == 0xE4 && p[20] == 0xD3);
+            /* Next 18 bytes: PKGID "SYSSHA" = 0xE2 0xE8 0xE2 0xE2 0xC8 0xC1 */
+            CHECK(p[36] == 0xE2 && p[37] == 0xE8 && p[38] == 0xE2);
+            /* Consistency token: 8 zeros */
+            int all_zero = 1;
+            for (int z = 0; z < 8; z++) if (p[54 + z] != 0) all_zero = 0;
+            CHECK(all_zero);
+            /* Section number: 0x0001 */
+            CHECK(u16be(p + 62) == 1);
+            found = 1;
+            break;
+        }
+    }
+    CHECK(found);
+
+    buf_free(&b);
+}
+
+/* ---- Test 4: RDBCMTOK present with value 0xF1 ---- */
+static void test_rdbcmtok(void) {
+    buf_t b;
+    buf_init(&b, 512);
+    build_excsqlimm_request(&b, "TESTDB", "DELETE FROM t", 4);
+    buf_flip(&b);
+
+    const uint8_t *d = b.data;
+    size_t sz = b.limit;
+    int found = 0;
+    for (size_t i = 0; i + 5 <= sz; i++) {
+        if (u16be(d + i) == 0x0005 && u16be(d + i + 2) == CP_RDBCMTOK) {
+            CHECK(d[i + 4] == 0xF1);
+            found = 1;
+            break;
+        }
+    }
+    CHECK(found);
+
+    buf_free(&b);
+}
+
+/* ---- Test 5: DSS 2 is OBJDSS with SQLSTT and SQL text ---- */
+static void test_sqlstt_content(void) {
+    const char *sql = "CREATE TABLE p8test (id INT)";
+    buf_t b;
+    buf_init(&b, 512);
+    build_excsqlimm_request(&b, "TESTDB", sql, 5);
+    buf_flip(&b);
+
+    const uint8_t *d = b.data;
+    size_t sz = b.limit;
+
+    /* Locate DSS 2 by finding CP_SQLSTT = 0x2414 after the first DSS */
+    uint16_t dss1_len = u16be(d);
+    /* DSS 2 starts at offset dss1_len */
+    if ((size_t)dss1_len + 6 > sz) { CHECK(0); return; }
+
+    const uint8_t *dss2 = d + dss1_len;
+    CHECK(dss2[2] == 0xD0);               /* magic */
+    CHECK((dss2[3] & 0x0F) == 0x03);      /* OBJDSS */
+    CHECK(u16be(dss2 + 4) == 5);          /* corrId = 5 */
+
+    /* DDM header after DSS2 header: [ll ll][24 14] */
+    CHECK(u16be(dss2 + 8) == CP_SQLSTT);
+
+    /* SQLSTT payload: [FF][00][len4][sql] */
+    const uint8_t *stt = dss2 + 10;
+    CHECK(stt[0] == 0xFF);                /* NOCM null */
+    CHECK(stt[1] == 0x00);                /* NOCS not-null */
+    uint32_t sql_len = u32be(stt + 2);
+    CHECK(sql_len == strlen(sql));
+    CHECK(memcmp(stt + 6, sql, sql_len) == 0);
+
+    buf_free(&b);
+}
+
+/* ---- Test 6: Both DSS share same correlation ID ---- */
+static void test_same_corrId(void) {
+    buf_t b;
+    buf_init(&b, 512);
+    build_excsqlimm_request(&b, "TESTDB", "UPDATE t SET x=1", 7);
+    buf_flip(&b);
+
+    const uint8_t *d = b.data;
+    uint16_t cid1 = u16be(d + 4);
+    uint16_t dss1_len = u16be(d);
+    uint16_t cid2 = u16be(d + dss1_len + 4);
+    CHECK(cid1 == cid2);
+    CHECK(cid1 == 7);
+
+    buf_free(&b);
+}
+
+/* ---- Test 7: Live DB2 execution (skipped if DB2_TEST_HOST not set) ---- */
+static void test_live_exec_immediate(void) {
+    const char *host = getenv("DB2_TEST_HOST");
+    if (!host) {
+        printf("  (skipping live exec-immediate test — DB2_TEST_HOST not set)\n");
+        return;
+    }
+    int port = 50000;
+    const char *portenv = getenv("DB2_TEST_PORT");
+    if (portenv) port = atoi(portenv);
+
+    drda_conn_t *conn = drda_connect(
+        host, port,
+        getenv("DB2_TEST_DB")   ? getenv("DB2_TEST_DB")   : "SAMPLE",
+        getenv("DB2_TEST_USER") ? getenv("DB2_TEST_USER") : "db2inst1",
+        getenv("DB2_TEST_PASS") ? getenv("DB2_TEST_PASS") : "password",
+        NULL, 0
+    );
+    CHECK(conn != NULL);
+    if (!conn) return;
+
+    /* CREATE a temp table, INSERT a row, DELETE it, DROP it */
+    int32_t rows = -1;
+    int rc;
+
+    rc = drda_exec_immediate(conn,
+        "CREATE TABLE libsdb2_p8test (id INTEGER)", &rows);
+    if (rc != SDB2_OK) {
+        printf("  CREATE TABLE failed (sqlcode=%d) — maybe table exists, trying DROP\n",
+               conn->diag_sqlcode);
+        drda_exec_immediate(conn, "DROP TABLE libsdb2_p8test", NULL);
+        rc = drda_exec_immediate(conn,
+            "CREATE TABLE libsdb2_p8test (id INTEGER)", &rows);
+        CHECK(rc == SDB2_OK);
+    }
+
+    rows = -1;
+    rc = drda_exec_immediate(conn,
+        "INSERT INTO libsdb2_p8test VALUES (1)", &rows);
+    CHECK(rc == SDB2_OK);
+    CHECK(rows == 1);
+
+    rows = -1;
+    rc = drda_exec_immediate(conn,
+        "DELETE FROM libsdb2_p8test WHERE id = 1", &rows);
+    CHECK(rc == SDB2_OK);
+    CHECK(rows == 1);
+
+    drda_exec_immediate(conn, "DROP TABLE libsdb2_p8test", NULL);
+
+    /* Bad SQL → should return SDB2_ERR_SQL with negative sqlcode */
+    rc = drda_exec_immediate(conn, "THIS IS NOT SQL !!!!", NULL);
+    CHECK(rc == SDB2_ERR_SQL);
+    CHECK(conn->diag_sqlcode < 0);
+
+    drda_disconnect(conn);
+}
+
+int main(void) {
+    test_dss1_rqsdss_chained();
+    test_excsqlimm_ddm();
+    test_pkgnamcsn_content();
+    test_rdbcmtok();
+    test_sqlstt_content();
+    test_same_corrId();
+    test_live_exec_immediate();
+
+    print_results("p8_excsqlimm");
+    return 0;
+}

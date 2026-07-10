@@ -1,0 +1,131 @@
+/* Phase 4 — delta file parser tests */
+#include <stdio.h>
+#include <string.h>
+#include "../src/delta.h"
+
+static int failed = 0;
+static int passed = 0;
+
+#define CHECK(expr) \
+    do { if (!(expr)) { \
+        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
+    } else { passed++; } } while(0)
+#define CHECK_EQ(a,b) \
+    do { if ((a)!=(b)) { \
+        printf("  FAIL [%d]: %s==%s  (%d != %d)\n", \
+               __LINE__, #a, #b, (int)(a), (int)(b)); failed++; \
+    } else { passed++; } } while(0)
+#define CHECK_STR(a,b) \
+    do { if (strcmp((a),(b))!=0) { \
+        printf("  FAIL [%d]: '%s' != '%s'\n", __LINE__, (a), (b)); failed++; \
+    } else { passed++; } } while(0)
+
+static void test_basic_parse(void) {
+    printf("  T1: Parse fixtures/sample.delta\n");
+    delta_file_t f;
+    int r = delta_parse_file("fixtures/sample.delta", &f);
+    CHECK_EQ(r, 0);
+    CHECK_EQ(f.terminator, ';');
+    CHECK_EQ(f.continue_on_error, 0);
+    CHECK_STR(f.author, "Alice");
+    CHECK_EQ(f.section_count, 2);
+
+    delta_section_t *cs = &f.sections[0];
+    CHECK_EQ(cs->kind, DELTA_CHANGESET);
+    CHECK_STR(cs->name, "create_users_table");
+    CHECK_EQ(cs->stmt_count, 1);
+    CHECK(strstr(cs->stmts[0], "CREATE TABLE users") != NULL);
+
+    delta_section_t *vs = &f.sections[1];
+    CHECK_EQ(vs->kind, DELTA_VALIDATION);
+    CHECK_STR(vs->name, "users_table_exists");
+    CHECK_EQ(vs->stmt_count, 1);
+    CHECK(strstr(vs->stmts[0], "syscat.tables") != NULL);
+
+    delta_free(&f);
+}
+
+static void test_at_terminator(void) {
+    printf("  T2: terminator=@ splits on @ not ;\n");
+    const char *text =
+        "terminator=@\n"
+        "author=Bob\n"
+        "\n"
+        "[changeset:create_proc]\n"
+        "CREATE PROCEDURE foo()\n"
+        "BEGIN\n"
+        "  DECLARE v INT;\n"
+        "  SET v = 1;\n"
+        "END@\n"
+        "[changeset:insert_row]\n"
+        "INSERT INTO bar VALUES(1)@\n";
+
+    delta_file_t f;
+    CHECK_EQ(delta_parse_string(text, "inline", &f), 0);
+    CHECK_EQ(f.terminator, '@');
+    CHECK_EQ(f.section_count, 2);
+    CHECK_EQ(f.sections[0].stmt_count, 1);
+    /* The procedure body contains ';' which must be preserved */
+    CHECK(strstr(f.sections[0].stmts[0], "SET v = 1;") != NULL);
+    CHECK_EQ(f.sections[1].stmt_count, 1);
+    delta_free(&f);
+}
+
+static void test_multi_stmt(void) {
+    printf("  T3: Multiple statements in one changeset\n");
+    const char *text =
+        "[changeset:multi]\n"
+        "INSERT INTO t VALUES(1);\n"
+        "INSERT INTO t VALUES(2);\n"
+        "INSERT INTO t VALUES(3);\n";
+
+    delta_file_t f;
+    CHECK_EQ(delta_parse_string(text, "inline", &f), 0);
+    CHECK_EQ(f.terminator, ';');
+    CHECK_EQ(f.section_count, 1);
+    CHECK_EQ(f.sections[0].stmt_count, 3);
+    delta_free(&f);
+}
+
+static void test_comment_skip(void) {
+    printf("  T4: Comment lines (#) are skipped\n");
+    const char *text =
+        "# this is a comment\n"
+        "author=Charlie\n"
+        "# another comment\n"
+        "[changeset:do_thing]\n"
+        "# comment in body\n"
+        "SELECT 1 FROM sysibm.sysdummy1;\n";
+
+    delta_file_t f;
+    CHECK_EQ(delta_parse_string(text, "inline", &f), 0);
+    CHECK_STR(f.author, "Charlie");
+    CHECK_EQ(f.section_count, 1);
+    CHECK_EQ(f.sections[0].stmt_count, 1);
+    delta_free(&f);
+}
+
+static void test_trailing_empty(void) {
+    printf("  T5: Trailing empty statement (trailing ;) is dropped\n");
+    const char *text =
+        "[changeset:trailing]\n"
+        "INSERT INTO t VALUES(1);\n"
+        "INSERT INTO t VALUES(2);\n"
+        "\n";  /* no trailing ; but blank line */
+
+    delta_file_t f;
+    CHECK_EQ(delta_parse_string(text, "inline", &f), 0);
+    CHECK_EQ(f.sections[0].stmt_count, 2);
+    delta_free(&f);
+}
+
+int main(void) {
+    printf("=== Phase 4 — delta file parser tests ===\n\n");
+    test_basic_parse();
+    test_at_terminator();
+    test_multi_stmt();
+    test_comment_skip();
+    test_trailing_empty();
+    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
+    return failed ? 1 : 0;
+}

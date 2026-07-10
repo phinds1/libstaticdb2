@@ -1,0 +1,92 @@
+/* Phase 5 — directory scanner + ASCII-betical sort tests */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "../src/scan.h"
+
+static int failed = 0;
+static int passed = 0;
+
+#define CHECK(expr) \
+    do { if (!(expr)) { \
+        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
+    } else { passed++; } } while(0)
+#define CHECK_EQ(a,b) \
+    do { if ((a)!=(b)) { \
+        printf("  FAIL [%d]: %s==%s  (%d != %d)\n", \
+               __LINE__, #a, #b, (int)(a), (int)(b)); failed++; \
+    } else { passed++; } } while(0)
+#define CHECK_STR(a,b) \
+    do { if (strcmp((a),(b))!=0) { \
+        printf("  FAIL [%d]: '%s' != '%s'\n", __LINE__, (a), (b)); failed++; \
+    } else { passed++; } } while(0)
+
+static void test_sort_basics(void) {
+    printf("  T1: scan_sort — byte-wise ascending\n");
+    char *a = "20_b.delta";
+    char *b = "10_a.delta";
+    char *c = "02_x.delta";
+    char *paths[] = {a, b, c};
+    scan_sort(paths, 3);
+    CHECK_STR(paths[0], "02_x.delta");
+    CHECK_STR(paths[1], "10_a.delta");
+    CHECK_STR(paths[2], "20_b.delta");
+}
+
+static void test_sort_string_not_numeric(void) {
+    printf("  T2: scan_sort — '10' before '2' (string not numeric)\n");
+    char *a = "2_second.delta";
+    char *b = "10_tenth.delta";
+    char *paths[] = {a, b};
+    scan_sort(paths, 2);
+    /* '1' (0x31) < '2' (0x32) so "10_tenth" sorts before "2_second" */
+    CHECK_STR(paths[0], "10_tenth.delta");
+    CHECK_STR(paths[1], "2_second.delta");
+}
+
+static void test_sort_by_basename(void) {
+    printf("  T3: scan_sort — sorts by basename, ignores directory prefix\n");
+    char *a = "/dir/z_last.delta";
+    char *b = "/other/a_first.delta";
+    char *paths[] = {a, b};
+    scan_sort(paths, 2);
+    CHECK_STR(paths[0], "/other/a_first.delta");
+    CHECK_STR(paths[1], "/dir/z_last.delta");
+}
+
+static void test_scan_dir(void) {
+    printf("  T4: scan_dir — only .delta files, sorted, no README.txt\n");
+    char **paths = NULL; int count = 0;
+    int r = scan_dir("fixtures/scandir", &paths, &count);
+    CHECK_EQ(r, 0);
+    CHECK_EQ(count, 3);
+    if (count == 3) {
+        /* Should be sorted: 20240101, 20240115, 20240201 */
+        CHECK(strstr(paths[0], "20240101") != NULL);
+        CHECK(strstr(paths[1], "20240115") != NULL);
+        CHECK(strstr(paths[2], "20240201") != NULL);
+        /* README.txt must not appear */
+        for (int i = 0; i < count; i++)
+            CHECK(strstr(paths[i], "README") == NULL);
+    }
+    scan_free(paths, count);
+}
+
+static void test_sort_single(void) {
+    printf("  T5: scan_sort — single element is fine\n");
+    char *a = "solo.delta";
+    char *paths[] = {a};
+    scan_sort(paths, 1);
+    CHECK_STR(paths[0], "solo.delta");
+}
+
+int main(void) {
+    printf("=== Phase 5 — scan + sort tests ===\n\n");
+    test_sort_basics();
+    test_sort_string_not_numeric();
+    test_sort_by_basename();
+    test_scan_dir();
+    test_sort_single();
+    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
+    return failed ? 1 : 0;
+}

@@ -1,0 +1,149 @@
+/* Phase 2 — CCSID conversion tests */
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "../src/ccsid.h"
+#include "../include/staticdb2/sdb2.h"
+#include "asserts.h"
+
+
+/* ---- UTF-8 (CCSID 1208): identity round-trip ---- */
+static void test_utf8(void) {
+    const char *s = "Hello, World!";
+    uint8_t wire[64], back[64];
+
+    int w = ccsid_utf8_to_wire(CCSID_UTF8,
+                                (const uint8_t *)s, strlen(s),
+                                wire, sizeof(wire));
+    CHECK(w == (int)strlen(s));
+    CHECK(memcmp(wire, s, (size_t)w) == 0);
+
+    int b = ccsid_wire_to_utf8(CCSID_UTF8, wire, (size_t)w, back, sizeof(back));
+    CHECK(b == w);
+    CHECK(memcmp(back, s, (size_t)b) == 0);
+}
+
+/* ---- ASCII (CCSID 367): identity for ASCII range ---- */
+static void test_ascii(void) {
+    const char *s = "SAMPLE_DB";
+    uint8_t wire[64], back[64];
+
+    int w = ccsid_utf8_to_wire(CCSID_ASCII,
+                                (const uint8_t *)s, strlen(s),
+                                wire, sizeof(wire));
+    CHECK(w == (int)strlen(s));
+    CHECK(memcmp(wire, s, (size_t)w) == 0);
+
+    int b = ccsid_wire_to_utf8(CCSID_ASCII, wire, (size_t)w, back, sizeof(back));
+    CHECK(b == w);
+    CHECK(memcmp(back, s, (size_t)b) == 0);
+
+    /* non-ASCII input must fail for CCSID 367 */
+    uint8_t hi = 0x80;
+    CHECK(ccsid_utf8_to_wire(CCSID_ASCII, &hi, 1, wire, sizeof(wire)) == SDB2_ERR_UNSUPPORT);
+}
+
+/* ---- EBCDIC (CCSID 500): known byte-fixture round-trip ---- */
+static void test_ebcdic_fixture(void) {
+    /*
+     * "SAMPLE" ASCII → EBCDIC CP-500 (hand-verified from IBM CDRA):
+     *  S=0xE2  A=0xC1  M=0xD4  P=0xD7  L=0xD3  E=0xC5
+     */
+    const char *ascii_in = "SAMPLE";
+    const uint8_t expected_ebcdic[] = { 0xE2, 0xC1, 0xD4, 0xD7, 0xD3, 0xC5 };
+    uint8_t wire[16], back[16];
+
+    int w = ccsid_utf8_to_wire(CCSID_EBCDIC,
+                                (const uint8_t *)ascii_in, strlen(ascii_in),
+                                wire, sizeof(wire));
+    CHECK(w == 6);
+    CHECK(memcmp(wire, expected_ebcdic, 6) == 0);
+
+    /* decode back */
+    int b = ccsid_wire_to_utf8(CCSID_EBCDIC, wire, (size_t)w, back, sizeof(back));
+    CHECK(b == 6);
+    CHECK(memcmp(back, ascii_in, 6) == 0);
+}
+
+/* ---- EBCDIC: numeric digits 0-9 ---- */
+static void test_ebcdic_digits(void) {
+    /* EBCDIC digits 0-9 are 0xF0-0xF9 */
+    const char *digits = "0123456789";
+    uint8_t wire[16];
+
+    int w = ccsid_utf8_to_wire(CCSID_EBCDIC,
+                                (const uint8_t *)digits, strlen(digits),
+                                wire, sizeof(wire));
+    CHECK(w == 10);
+    for (int i = 0; i < 10; i++) {
+        CHECK(wire[i] == (uint8_t)(0xF0 + i));
+    }
+
+    /* round-trip */
+    uint8_t back[16];
+    int b = ccsid_wire_to_utf8(CCSID_EBCDIC, wire, (size_t)w, back, sizeof(back));
+    CHECK(b == 10);
+    CHECK(memcmp(back, digits, 10) == 0);
+}
+
+/* ---- EBCDIC: space and dot (used in RDBNAM padding) ---- */
+static void test_ebcdic_space_dot(void) {
+    const char *s = " .";
+    uint8_t wire[4];
+
+    int w = ccsid_utf8_to_wire(CCSID_EBCDIC,
+                                (const uint8_t *)s, 2,
+                                wire, sizeof(wire));
+    CHECK(w == 2);
+    CHECK(wire[0] == 0x40);  /* EBCDIC space */
+    CHECK(wire[1] == 0x4B);  /* EBCDIC '.'   */
+}
+
+/* ---- EBCDIC: full DB name as used in RDBNAM control field ---- */
+static void test_ebcdic_rdbnam(void) {
+    const char *dbname = "TESTDB";
+    /* T=0xE3  E=0xC5  S=0xE2  T=0xE3  D=0xC4  B=0xC2 */
+    const uint8_t expected[] = { 0xE3, 0xC5, 0xE2, 0xE3, 0xC4, 0xC2 };
+    uint8_t wire[16], back[16];
+
+    int w = ccsid_utf8_to_wire(CCSID_EBCDIC,
+                                (const uint8_t *)dbname, strlen(dbname),
+                                wire, sizeof(wire));
+    CHECK(w == 6);
+    CHECK(memcmp(wire, expected, 6) == 0);
+
+    int b = ccsid_wire_to_utf8(CCSID_EBCDIC, wire, (size_t)w, back, sizeof(back));
+    CHECK(b == 6);
+    CHECK(memcmp(back, dbname, 6) == 0);
+}
+
+/* ---- output truncation detection ---- */
+static void test_truncation(void) {
+    const char *s = "HELLO";
+    uint8_t wire[2];  /* too small for 5 bytes */
+    int r = ccsid_utf8_to_wire(CCSID_EBCDIC,
+                                (const uint8_t *)s, strlen(s),
+                                wire, sizeof(wire));
+    CHECK(r == SDB2_ERR_TRUNC);
+}
+
+/* ---- unknown CCSID ---- */
+static void test_unknown_ccsid(void) {
+    uint8_t buf[8];
+    CHECK(ccsid_utf8_to_wire(9999, (const uint8_t *)"x", 1, buf, 8)
+          == SDB2_ERR_UNSUPPORT);
+}
+
+int main(void) {
+    test_utf8();
+    test_ascii();
+    test_ebcdic_fixture();
+    test_ebcdic_digits();
+    test_ebcdic_space_dot();
+    test_ebcdic_rdbnam();
+    test_truncation();
+    test_unknown_ccsid();
+
+    print_results("p2_ccsid");
+    return 0;
+}

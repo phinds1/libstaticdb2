@@ -1,0 +1,294 @@
+/* Phase 13 — Transactions & connection attributes tests
+ *
+ * Fixture-based tests (no DB2 needed):
+ *   T1.  SQLSetConnectAttr(SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF) stores flag
+ *   T2.  autocommit OFF is synced to conn->autocommit when already connected
+ *        (uses mock conn struct directly)
+ *   T3.  SQLEndTran on NULL handle → SQL_INVALID_HANDLE
+ *   T4.  SQLEndTran on disconnected DBC → SQL_ERROR
+ *   T5.  SQLEndTran on ENV handle (trivial case) → SQL_SUCCESS
+ *   T6.  SQLGetConnectAttr round-trip: OFF then ON
+ *
+ * Live DB2 tests (skipped unless DB2_TEST_HOST is set):
+ *   L1.  autocommit ON: INSERT persists without explicit commit
+ *   L2.  autocommit OFF: INSERT + ROLLBACK → no row
+ *   L3.  autocommit OFF: INSERT + COMMIT → row persists
+ *   L4.  autocommit OFF: multiple INSERTs + single COMMIT → all persist
+ *   L5.  Cleanup (DROP TABLE)
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "staticdb2/sql.h"
+#include "staticdb2/sdb2.h"
+#include "handles.h"   /* sdb2_dbc_t for autocommit inspection */
+#include "drda.h"      /* drda_conn_t for autocommit field */
+#include "asserts.h"
+
+static int live_skipped = 0;
+
+
+
+/* ================================================================== */
+/* Fixture-based tests                                                  */
+/* ================================================================== */
+
+static void test_t1_autocommit_attribute(void) {
+    printf("  T1: SQLSetConnectAttr autocommit stores flag\n");
+    SQLHENV henv; SQLHDBC hdbc;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+
+    sdb2_dbc_t *dbc = (sdb2_dbc_t *)hdbc;
+    CHECK_EQ(dbc->autocommit, 1); /* default ON */
+
+    SQLRETURN rc = SQLSetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT,
+                                     (SQLPOINTER)(intptr_t)SQL_AUTOCOMMIT_OFF, 0);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK_EQ(dbc->autocommit, 0);
+
+    rc = SQLSetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT,
+                           (SQLPOINTER)(intptr_t)SQL_AUTOCOMMIT_ON, 0);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK_EQ(dbc->autocommit, 1);
+
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_t2_autocommit_syncs_to_conn(void) {
+    printf("  T2: autocommit change syncs to conn->autocommit\n");
+    SQLHENV henv; SQLHDBC hdbc;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+
+    sdb2_dbc_t *dbc = (sdb2_dbc_t *)hdbc;
+
+    /* Manually attach a fake drda_conn_t with autocommit=1 */
+    drda_conn_t fake_conn;
+    memset(&fake_conn, 0, sizeof fake_conn);
+    fake_conn.fd         = -1;
+    fake_conn.autocommit = 1;
+    dbc->conn = &fake_conn;
+
+    CHECK_EQ(fake_conn.autocommit, 1);
+
+    SQLSetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT,
+                      (SQLPOINTER)(intptr_t)SQL_AUTOCOMMIT_OFF, 0);
+    CHECK_EQ(dbc->autocommit, 0);
+    CHECK_EQ(fake_conn.autocommit, 0); /* synced to conn */
+
+    SQLSetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT,
+                      (SQLPOINTER)(intptr_t)SQL_AUTOCOMMIT_ON, 0);
+    CHECK_EQ(fake_conn.autocommit, 1);
+
+    /* Detach fake conn before freeing (avoid double-free in SQLFreeHandle) */
+    dbc->conn = NULL;
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_t3_endtran_null_handle(void) {
+    printf("  T3: SQLEndTran NULL handle → SQL_INVALID_HANDLE\n");
+    SQLRETURN rc = SQLEndTran(SQL_HANDLE_DBC, NULL, SQL_COMMIT);
+    CHECK_EQ(rc, SQL_INVALID_HANDLE);
+}
+
+static void test_t4_endtran_not_connected(void) {
+    printf("  T4: SQLEndTran disconnected DBC → SQL_ERROR\n");
+    SQLHENV henv; SQLHDBC hdbc;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+
+    SQLRETURN rc = SQLEndTran(SQL_HANDLE_DBC, hdbc, SQL_COMMIT);
+    CHECK_EQ(rc, SQL_ERROR);
+
+    /* Verify diagnostic */
+    SQLCHAR msg[256]; SQLSMALLINT mlen; SQLINTEGER native; SQLCHAR state[6];
+    rc = SQLGetDiagRec(SQL_HANDLE_DBC, hdbc, 1, state, &native, msg, sizeof msg, &mlen);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK(strstr((char *)msg, "connected") != NULL ||
+          strstr((char *)msg, "connect")   != NULL);
+
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_t5_endtran_env_handle(void) {
+    printf("  T5: SQLEndTran ENV handle (no connections) → SQL_SUCCESS\n");
+    SQLHENV henv;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLRETURN rc = SQLEndTran(SQL_HANDLE_ENV, henv, SQL_COMMIT);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    rc = SQLEndTran(SQL_HANDLE_ENV, henv, SQL_ROLLBACK);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_t6_getconnectattr_roundtrip(void) {
+    printf("  T6: SQLGetConnectAttr autocommit round-trip\n");
+    SQLHENV henv; SQLHDBC hdbc;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+
+    /* Default: ON */
+    SQLUINTEGER val = 99;
+    SQLRETURN rc = SQLGetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT, &val, 0, NULL);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK_EQ((int)val, SQL_AUTOCOMMIT_ON);
+
+    /* Set OFF then read back */
+    SQLSetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT,
+                      (SQLPOINTER)(intptr_t)SQL_AUTOCOMMIT_OFF, 0);
+    rc = SQLGetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT, &val, 0, NULL);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK_EQ((int)val, SQL_AUTOCOMMIT_OFF);
+
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+/* ================================================================== */
+/* Live DB2 tests                                                       */
+/* ================================================================== */
+
+static void run_live_tests(const char *host, int port,
+                            const char *db, const char *uid, const char *pwd) {
+    printf("\n--- Live DB2 tests (host=%s:%d db=%s) ---\n", host, port, db);
+
+    SQLHENV henv; SQLHDBC hdbc; SQLHSTMT hstmt;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+    SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+
+    char cs[512];
+    snprintf(cs, sizeof cs,
+             "HOSTNAME=%s;PORT=%d;DATABASE=%s;UID=%s;PWD=%s",
+             host, port, db, uid, pwd);
+    SQLRETURN rc = SQLDriverConnect(hdbc, NULL, (SQLCHAR *)cs, SQL_NTS,
+                                    NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+    if (rc != SQL_SUCCESS) {
+        SQLCHAR msg[256]; SQLSMALLINT mlen; SQLINTEGER native; SQLCHAR state[6];
+        SQLGetDiagRec(SQL_HANDLE_DBC, hdbc, 1, state, &native, msg, sizeof msg, &mlen);
+        printf("  SKIP live tests: connect failed: %s\n", (char *)msg);
+        live_skipped += 5;
+        goto cleanup;
+    }
+
+    /* Create test table */
+    rc = SQLExecDirect(hstmt,
+        (SQLCHAR *)"CREATE TABLE p13test (id INTEGER NOT NULL, val VARCHAR(50))",
+        SQL_NTS);
+    if (rc != SQL_SUCCESS) {
+        SQLCHAR msg[256]; SQLSMALLINT mlen; SQLINTEGER native; SQLCHAR st[6];
+        SQLGetDiagRec(SQL_HANDLE_STMT, hstmt, 1, st, &native, msg, sizeof msg, &mlen);
+        printf("  SKIP: CREATE TABLE failed: %s\n", (char *)msg);
+        live_skipped += 5;
+        goto disconnect;
+    }
+
+    /* Helper: count rows in p13test */
+    #define COUNT_ROWS(expected) do { \
+        SQLFreeStmt(hstmt, SQL_CLOSE); \
+        SQLExecDirect(hstmt, (SQLCHAR *)"SELECT COUNT(*) FROM p13test", SQL_NTS); \
+        int32_t cnt = -1; SQLLEN ind = 0; \
+        SQLBindCol(hstmt, 1, SQL_C_LONG, &cnt, sizeof cnt, &ind); \
+        SQLFetch(hstmt); \
+        CHECK_EQ((int)cnt, (expected)); \
+        SQLFreeStmt(hstmt, SQL_CLOSE); \
+    } while(0)
+
+    /* L1: autocommit ON — INSERT persists without explicit commit */
+    printf("  L1: autocommit ON: INSERT persists\n");
+    CHECK_EQ((int)SQLGetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT, NULL, 0, NULL), SQL_SUCCESS);
+    rc = SQLExecDirect(hstmt,
+        (SQLCHAR *)"INSERT INTO p13test VALUES(1, 'auto')", SQL_NTS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    COUNT_ROWS(1);
+
+    /* L2: autocommit OFF: INSERT + ROLLBACK → row is gone */
+    printf("  L2: autocommit OFF: INSERT + ROLLBACK → 0 rows\n");
+    SQLSetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT,
+                      (SQLPOINTER)(intptr_t)SQL_AUTOCOMMIT_OFF, 0);
+    rc = SQLExecDirect(hstmt,
+        (SQLCHAR *)"INSERT INTO p13test VALUES(2, 'rollback')", SQL_NTS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    rc = SQLEndTran(SQL_HANDLE_DBC, hdbc, SQL_ROLLBACK);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    COUNT_ROWS(1); /* only row 1 from autocommit test survives */
+
+    /* L3: autocommit OFF: INSERT + COMMIT → row persists */
+    printf("  L3: autocommit OFF: INSERT + COMMIT → row persists\n");
+    rc = SQLExecDirect(hstmt,
+        (SQLCHAR *)"INSERT INTO p13test VALUES(3, 'commit')", SQL_NTS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    rc = SQLEndTran(SQL_HANDLE_DBC, hdbc, SQL_COMMIT);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    COUNT_ROWS(2); /* rows 1 and 3 */
+
+    /* L4: multiple INSERTs in one transaction + single COMMIT */
+    printf("  L4: multiple INSERTs + single COMMIT → all persist\n");
+    rc = SQLExecDirect(hstmt,
+        (SQLCHAR *)"INSERT INTO p13test VALUES(4, 'batch1')", SQL_NTS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    rc = SQLExecDirect(hstmt,
+        (SQLCHAR *)"INSERT INTO p13test VALUES(5, 'batch2')", SQL_NTS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    rc = SQLEndTran(SQL_HANDLE_DBC, hdbc, SQL_COMMIT);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    COUNT_ROWS(4); /* rows 1, 3, 4, 5 */
+
+    /* L5: cleanup */
+    printf("  L5: DROP TABLE cleanup\n");
+    /* Turn autocommit back on for cleanup */
+    SQLSetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT,
+                      (SQLPOINTER)(intptr_t)SQL_AUTOCOMMIT_ON, 0);
+    rc = SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE p13test", SQL_NTS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+
+disconnect:
+    SQLDisconnect(hdbc);
+cleanup:
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+/* ================================================================== */
+/* main                                                                 */
+/* ================================================================== */
+
+int main(void) {
+    printf("=== Phase 13 — Transactions & connection attributes ===\n\n");
+    printf("--- Fixture tests (no DB2 needed) ---\n");
+
+    test_t1_autocommit_attribute();
+    test_t2_autocommit_syncs_to_conn();
+    test_t3_endtran_null_handle();
+    test_t4_endtran_not_connected();
+    test_t5_endtran_env_handle();
+    test_t6_getconnectattr_roundtrip();
+
+    const char *db2host = getenv("DB2_TEST_HOST");
+    if (db2host) {
+        int port = 50000;
+        const char *penv = getenv("DB2_TEST_PORT");
+        if (penv) port = atoi(penv);
+        const char *db  = getenv("DB2_TEST_DB");   if (!db)  db  = "SAMPLE";
+        const char *uid = getenv("DB2_TEST_USER");  if (!uid) uid = "db2inst1";
+        const char *pwd = getenv("DB2_TEST_PASS");  if (!pwd) pwd = "";
+        run_live_tests(db2host, port, db, uid, pwd);
+    } else {
+        printf("\n(Live DB2 tests SKIPPED: set DB2_TEST_HOST to enable)\n");
+        live_skipped += 5;
+    }
+
+    if (live_skipped) {
+        printf("\n(Live DB2 tests skipped: %d)\n", live_skipped);
+    }
+
+    print_results("p13_txn");
+    return 0;
+}

@@ -1,0 +1,70 @@
+/* Phase 8 — validation_passes truth table (no DB) */
+#include <stdio.h>
+#include <string.h>
+#include "../src/engine.h"
+#include "../../include/staticdb2/sdb2.h"
+
+static int failed = 0;
+static int passed = 0;
+
+#define CHECK_PASS(had_row, val_ptr, expected) \
+    do { \
+        int p = validation_passes((val_ptr), (had_row)); \
+        if (p != (expected)) { \
+            printf("  FAIL [%d]: validation_passes(%d,...) = %d expected %d\n", \
+                   __LINE__, had_row, p, expected); \
+            failed++; \
+        } else { passed++; } \
+    } while(0)
+
+static sdb2_value_t make_int32(int32_t v) {
+    sdb2_value_t val; memset(&val, 0, sizeof(val));
+    val.type = SDB2_C_INT32; val.v.i32 = v; return val;
+}
+static sdb2_value_t make_str(const char *s) {
+    sdb2_value_t val; memset(&val, 0, sizeof(val));
+    val.type = SDB2_C_VARCHAR;
+    int n = (int)strlen(s);
+    memcpy(val.v.str.data, s, (size_t)n);
+    val.v.str.data[n] = '\0';
+    val.v.str.len = n;
+    return val;
+}
+static sdb2_value_t make_null(void) {
+    sdb2_value_t val; memset(&val, 0, sizeof(val));
+    val.type = SDB2_C_INT32; val.is_null = 1; return val;
+}
+
+int main(void) {
+    printf("=== Phase 8 — validation_passes truth table ===\n\n");
+
+    printf("  T1: had_row=0 → fail\n");
+    CHECK_PASS(0, NULL, 0);
+
+    printf("  T2: integer 0 → fail\n");
+    sdb2_value_t z = make_int32(0);
+    CHECK_PASS(1, &z, 0);
+
+    printf("  T3: integer 5 → pass\n");
+    sdb2_value_t five = make_int32(5);
+    CHECK_PASS(1, &five, 1);
+
+    printf("  T4: empty string → fail\n");
+    sdb2_value_t empty = make_str("");
+    CHECK_PASS(1, &empty, 0);
+
+    printf("  T5: non-empty string → pass\n");
+    sdb2_value_t s = make_str("some result");
+    CHECK_PASS(1, &s, 1);
+
+    printf("  T6: NULL indicator → fail\n");
+    sdb2_value_t n = make_null();
+    CHECK_PASS(1, &n, 0);
+
+    printf("  T7: integer 1 → pass\n");
+    sdb2_value_t one = make_int32(1);
+    CHECK_PASS(1, &one, 1);
+
+    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
+    return failed ? 1 : 0;
+}

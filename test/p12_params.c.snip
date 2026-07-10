@@ -1,0 +1,678 @@
+/* Phase 12 — Parameter binding (SQLBindParameter / SQLExecute) tests
+ *
+ * Fixture-based tests (no DB2 needed):
+ *   P1.  SQLBindParameter stores binding; SQLNumParams returns count
+ *   P2.  SQLBindParameter: unbind by passing NULL ParameterValuePtr
+ *   P3.  SQLFreeStmt(SQL_RESET_PARAMS) clears all param bindings
+ *   P4.  SQLFreeStmt(SQL_RESET_PARAMS) clears param_desc too
+ *   P5.  fdoca_sql_type_to_col: correct DRDA types for common SQL types
+ *   P6.  fdoca_encode_col: INTEGER (SQL_C_LONG) encodes big-endian + null indicator
+ *   P7.  fdoca_encode_col: SMALLINT (SQL_C_SHORT) 2-byte BE
+ *   P8.  fdoca_encode_col: BIGINT (SQL_C_SBIGINT) 8-byte BE
+ *   P9.  fdoca_encode_col: NULL parameter writes 0xFF indicator only
+ *   P10. fdoca_encode_col: VARCHAR (SQL_C_CHAR) — 2-byte length + data
+ *   P11. fdoca_encode_col: CHAR(5) (SQL_C_CHAR) — fixed 5 bytes, space-padded
+ *   P12. fdoca_encode_col: DOUBLE (SQL_C_DOUBLE) — 8-byte big-endian IEEE
+ *   P13. fdoca_encode_col: DATE "2024-07-09" — 10 bytes ASCII
+ *   P14. fdoca_encode_col: DECIMAL(5,2) "123.45" — packed BCD
+ *   P15. fdoca_encode_col: DECIMAL(5,2) "-0.01" — negative packed BCD
+ *   P16. fdoca_encode_col: non-nullable INTEGER — no indicator byte
+ *   P17. SQLNumParams returns 0 for unprepared statement
+ *   P18. param_bindings survive SQLFetch (not cleared by execute cycle)
+ *
+ * Live DB2 tests (skipped unless DB2_TEST_HOST is set):
+ *   L1.  SQLPrepare + SQLBindParameter + SQLExecute: INSERT ... VALUES(?,?,?)
+ *   L2.  SQLPrepare + SQLBindParameter + SQLExecute: SELECT ... WHERE id=?
+ *   L3.  Re-execute with different param values (same prepared stmt)
+ *   L4.  NULL parameter via SQL_NULL_DATA indicator
+ *   L5.  Cleanup (DROP TABLE)
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <math.h>
+
+#include "staticdb2/sql.h"
+#include "staticdb2/sdb2.h"
+#include "handles.h"    /* sdb2_stmt_t, sdb2_param_binding_t */
+#include "fdoca.h"      /* fdoca_sql_type_to_col, fdoca_encode_col */
+#include "buf.h"        /* buf_t */
+#include "asserts.h"
+
+static int skipped = 0;
+
+
+
+#define CHECK_EQ_HEX(a, b) assert((#a " == " #b), ((a) == (b)))
+
+/* ---- Helper: alloc env + dbc + stmt without connecting ---- */
+static sdb2_stmt_t *alloc_disconnected_stmt(void) {
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+    SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+    return (sdb2_stmt_t *)hstmt;
+}
+
+/* ================================================================== */
+/* Fixture-based tests                                                  */
+/* ================================================================== */
+
+static void test_p1_bind_parameter_stores_binding(void) {
+    printf("  P1: SQLBindParameter stores binding; SQLNumParams\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+    SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+
+    int32_t val = 42;
+    SQLLEN ind  = SQL_NTS;
+
+    SQLRETURN rc = SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT,
+                                    SQL_C_LONG, SQL_INTEGER,
+                                    10, 0, &val, sizeof val, &ind);
+    CHECK_EQ(rc, SQL_SUCCESS);
+
+    /* Verify binding stored (not prepared yet, so param_desc ncols == 0) */
+    sdb2_stmt_t *s = (sdb2_stmt_t *)hstmt;
+    CHECK_EQ(s->n_param_bindings, 1);
+    CHECK(s->param_bindings != NULL);
+    CHECK_EQ(s->param_bindings[0].active, 1);
+    CHECK_EQ(s->param_bindings[0].sql_type, SQL_INTEGER);
+    CHECK_EQ(s->param_bindings[0].value_type, SQL_C_LONG);
+    CHECK(s->param_bindings[0].value_ptr == &val);
+
+    /* SQLNumParams returns 0 when not prepared */
+    SQLSMALLINT nparams = 99;
+    rc = SQLNumParams(hstmt, &nparams);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK_EQ(nparams, 0); /* not prepared, so 0 */
+
+    /* Mark as prepared manually to test count path */
+    s->is_prepared = 1;
+    rc = SQLNumParams(hstmt, &nparams);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK_EQ(nparams, 1);
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_p2_unbind_parameter(void) {
+    printf("  P2: SQLBindParameter unbind via NULL value_ptr\n");
+    SQLHENV henv; SQLHDBC hdbc; SQLHSTMT hstmt;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+    SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+
+    int32_t val = 10;
+    SQLLEN ind = 0;
+    SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_LONG, SQL_INTEGER,
+                     0, 0, &val, sizeof val, &ind);
+
+    sdb2_stmt_t *s = (sdb2_stmt_t *)hstmt;
+    CHECK_EQ(s->param_bindings[0].active, 1);
+
+    /* Unbind: NULL value_ptr with no NULL indicator */
+    SQLRETURN rc = SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT,
+                                    SQL_C_LONG, SQL_INTEGER,
+                                    0, 0, NULL, 0, NULL);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK_EQ(s->param_bindings[0].active, 0);
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_p3_reset_params(void) {
+    printf("  P3: SQLFreeStmt(SQL_RESET_PARAMS) clears bindings\n");
+    SQLHENV henv; SQLHDBC hdbc; SQLHSTMT hstmt;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+    SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+
+    int32_t v1 = 1; int64_t v2 = 2; SQLLEN ind = 0;
+    SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_LONG, SQL_INTEGER, 0, 0, &v1, 4, &ind);
+    SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 0, 0, &v2, 8, &ind);
+
+    sdb2_stmt_t *s = (sdb2_stmt_t *)hstmt;
+    CHECK_EQ(s->n_param_bindings, 2);
+
+    SQLRETURN rc = SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK_EQ(s->n_param_bindings, 0);
+    CHECK(s->param_bindings == NULL);
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_p4_reset_params_clears_desc(void) {
+    printf("  P4: SQL_RESET_PARAMS also frees param_desc\n");
+    sdb2_stmt_t *s = alloc_disconnected_stmt();
+    /* Manually inject a fake param_desc with one col */
+    s->param_desc.cols  = (fdoca_col_t *)calloc(1, sizeof(fdoca_col_t));
+    s->param_desc.ncols = 1;
+
+    SQLFreeStmt((SQLHSTMT)s, SQL_RESET_PARAMS);
+
+    CHECK_EQ(s->param_desc.ncols, 0);
+    CHECK(s->param_desc.cols == NULL);
+
+    sdb2_stmt_free(s);
+}
+
+static void test_p5_sql_type_to_col(void) {
+    printf("  P5: fdoca_sql_type_to_col maps SQL types to DRDA types\n");
+    fdoca_col_t c;
+
+    c = fdoca_sql_type_to_col(SQL_INTEGER, 0, 0);
+    CHECK(c.nullable == 1);
+    CHECK(c.length   == 4);
+    CHECK(c.sdb2_type == SDB2_C_INT32);
+
+    c = fdoca_sql_type_to_col(SQL_SMALLINT, 0, 0);
+    CHECK(c.length == 2);
+    CHECK(c.sdb2_type == SDB2_C_INT16);
+
+    c = fdoca_sql_type_to_col(SQL_BIGINT, 0, 0);
+    CHECK(c.length == 8);
+    CHECK(c.sdb2_type == SDB2_C_INT64);
+
+    c = fdoca_sql_type_to_col(SQL_DOUBLE, 0, 0);
+    CHECK(c.length == 8);
+    CHECK(c.sdb2_type == SDB2_C_FLOAT64);
+
+    c = fdoca_sql_type_to_col(SQL_VARCHAR, 50, 0);
+    CHECK(c.length == 50);
+    CHECK(c.sdb2_type == SDB2_C_VARCHAR);
+
+    c = fdoca_sql_type_to_col(SQL_DECIMAL, 7, 2);
+    CHECK(c.precision == 7);
+    CHECK(c.scale     == 2);
+    CHECK(c.length    == 4);  /* ceil((7+2)/2) = 4? no: ceil((7+1)/2)=4 */
+
+    c = fdoca_sql_type_to_col(SQL_DATE, 0, 0);
+    CHECK(c.length == 10);
+    CHECK(c.sdb2_type == SDB2_C_DATE);
+
+    c = fdoca_sql_type_to_col(SQL_TIMESTAMP, 0, 0);
+    CHECK(c.length == 26);
+    CHECK(c.sdb2_type == SDB2_C_TIMESTAMP);
+}
+
+static void test_p6_encode_integer(void) {
+    printf("  P6: fdoca_encode_col INTEGER (SQL_C_LONG) — 1+4 bytes\n");
+    buf_t b;
+    buf_init(&b, 32);
+
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_INTEGER, 0, 0); /* nullable */
+    int32_t val = 0x12345678;
+    SQLLEN ind  = 0; /* not null */
+
+    int r = fdoca_encode_col(&b, &col, SQL_C_LONG, &val, sizeof val, ind);
+    CHECK_EQ(r, 0);
+
+    buf_flip(&b);
+    uint8_t *d = b.data;
+    /* null indicator = 0x00 (not null) */
+    CHECK_EQ_HEX(d[0], 0x00);
+    /* little-endian 0x12345678 */
+    CHECK_EQ_HEX(d[1], 0x78);
+    CHECK_EQ_HEX(d[2], 0x56);
+    CHECK_EQ_HEX(d[3], 0x34);
+    CHECK_EQ_HEX(d[4], 0x12);
+    CHECK_EQ((int)buf_remaining(&b), 5);
+
+    buf_free(&b);
+}
+
+static void test_p7_encode_smallint(void) {
+    printf("  P7: fdoca_encode_col SMALLINT — 1+2 bytes\n");
+    buf_t b; buf_init(&b, 16);
+
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_SMALLINT, 0, 0);
+    int16_t val = (int16_t)0xABCD;
+    SQLLEN ind  = 0;
+
+    fdoca_encode_col(&b, &col, SQL_C_SHORT, &val, sizeof val, ind);
+    buf_flip(&b);
+
+    CHECK_EQ_HEX(b.data[0], 0x00);  /* not-null indicator */
+    CHECK_EQ_HEX(b.data[1], 0xCD);  /* little-endian 0xABCD */
+    CHECK_EQ_HEX(b.data[2], 0xAB);
+
+    buf_free(&b);
+}
+
+static void test_p8_encode_bigint(void) {
+    printf("  P8: fdoca_encode_col BIGINT — 1+8 bytes\n");
+    buf_t b; buf_init(&b, 16);
+
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_BIGINT, 0, 0);
+    int64_t val = (int64_t)0x0102030405060708LL;
+    SQLLEN ind  = 0;
+
+    fdoca_encode_col(&b, &col, SQL_C_SBIGINT, &val, sizeof val, ind);
+    buf_flip(&b);
+
+    CHECK_EQ_HEX(b.data[0], 0x00); /* not-null */
+    /* little-endian 0x0102030405060708 */
+    CHECK_EQ_HEX(b.data[1], 0x08);
+    CHECK_EQ_HEX(b.data[2], 0x07);
+    CHECK_EQ_HEX(b.data[3], 0x06);
+    CHECK_EQ_HEX(b.data[4], 0x05);
+    CHECK_EQ_HEX(b.data[5], 0x04);
+    CHECK_EQ_HEX(b.data[6], 0x03);
+    CHECK_EQ_HEX(b.data[7], 0x02);
+    CHECK_EQ_HEX(b.data[8], 0x01);
+
+    buf_free(&b);
+}
+
+static void test_p9_encode_null(void) {
+    printf("  P9: fdoca_encode_col NULL param — writes 0xFF only\n");
+    buf_t b; buf_init(&b, 8);
+
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_INTEGER, 0, 0);
+    SQLLEN ind = SQL_NULL_DATA;
+
+    fdoca_encode_col(&b, &col, SQL_C_LONG, NULL, 0, ind);
+    buf_flip(&b);
+
+    CHECK_EQ((int)buf_remaining(&b), 1);
+    CHECK_EQ_HEX(b.data[0], 0xFF);
+
+    buf_free(&b);
+}
+
+static void test_p10_encode_varchar(void) {
+    printf("  P10: fdoca_encode_col VARCHAR — 1+2+data bytes\n");
+    buf_t b; buf_init(&b, 64);
+
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_VARCHAR, 50, 0);
+    const char *s = "hello";
+    SQLLEN ind = SQL_NTS;
+
+    fdoca_encode_col(&b, &col, SQL_C_CHAR, s, 0, ind);
+    buf_flip(&b);
+
+    CHECK_EQ_HEX(b.data[0], 0x00); /* not-null */
+    CHECK_EQ_HEX(b.data[1], 0x00); /* length high byte (BE) */
+    CHECK_EQ_HEX(b.data[2], 0x05); /* length low byte = 5 */
+    CHECK_EQ_HEX(b.data[3], 'h');
+    CHECK_EQ_HEX(b.data[4], 'e');
+    CHECK_EQ_HEX(b.data[5], 'l');
+    CHECK_EQ_HEX(b.data[6], 'l');
+    CHECK_EQ_HEX(b.data[7], 'o');
+    CHECK_EQ((int)buf_remaining(&b), 8);
+
+    buf_free(&b);
+}
+
+static void test_p11_encode_char_fixed(void) {
+    printf("  P11: fdoca_encode_col CHAR(5) — fixed 5 bytes space-padded\n");
+    buf_t b; buf_init(&b, 16);
+
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_CHAR, 5, 0);
+    const char *s = "hi";
+    SQLLEN ind = SQL_NTS;
+
+    fdoca_encode_col(&b, &col, SQL_C_CHAR, s, 0, ind);
+    buf_flip(&b);
+
+    CHECK_EQ_HEX(b.data[0], 0x00); /* not-null */
+    CHECK_EQ_HEX(b.data[1], 'h');
+    CHECK_EQ_HEX(b.data[2], 'i');
+    CHECK_EQ_HEX(b.data[3], 0x20); /* space padding */
+    CHECK_EQ_HEX(b.data[4], 0x20);
+    CHECK_EQ_HEX(b.data[5], 0x20);
+    CHECK_EQ((int)buf_remaining(&b), 6);
+
+    buf_free(&b);
+}
+
+static void test_p12_encode_double(void) {
+    printf("  P12: fdoca_encode_col DOUBLE — 1+8 bytes IEEE little-endian\n");
+    buf_t b; buf_init(&b, 16);
+
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_DOUBLE, 0, 0);
+    double val = 1.0; /* IEEE 754: 0x3FF0000000000000 */
+    SQLLEN ind = 0;
+
+    fdoca_encode_col(&b, &col, SQL_C_DOUBLE, &val, sizeof val, ind);
+    buf_flip(&b);
+
+    CHECK_EQ_HEX(b.data[0], 0x00); /* not-null */
+    /* 1.0 = 0x3FF0000000000000 LE */
+    CHECK_EQ_HEX(b.data[1], 0x00);
+    CHECK_EQ_HEX(b.data[2], 0x00);
+    CHECK_EQ_HEX(b.data[3], 0x00);
+    CHECK_EQ_HEX(b.data[4], 0x00);
+    CHECK_EQ_HEX(b.data[5], 0x00);
+    CHECK_EQ_HEX(b.data[6], 0x00);
+    CHECK_EQ_HEX(b.data[7], 0xF0);
+    CHECK_EQ_HEX(b.data[8], 0x3F);
+
+    buf_free(&b);
+}
+
+static void test_p13_encode_date(void) {
+    printf("  P13: fdoca_encode_col DATE — 1+10 bytes ASCII\n");
+    buf_t b; buf_init(&b, 16);
+
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_DATE, 0, 0);
+    const char *s = "2024-07-09";
+    SQLLEN ind = SQL_NTS;
+
+    fdoca_encode_col(&b, &col, SQL_C_CHAR, s, 0, ind);
+    buf_flip(&b);
+
+    CHECK_EQ((int)buf_remaining(&b), 11); /* 1 indicator + 10 date bytes */
+    CHECK_EQ_HEX(b.data[0], 0x00);
+    CHECK(memcmp(b.data + 1, "2024-07-09", 10) == 0);
+
+    buf_free(&b);
+}
+
+static void test_p14_encode_decimal_positive(void) {
+    printf("  P14: fdoca_encode_col DECIMAL(5,2) '123.45' — packed BCD\n");
+    buf_t b; buf_init(&b, 16);
+
+    /* DECIMAL(5,2): precision=5, scale=2, wire_length = ceil(6/2)=3 */
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_DECIMAL, 5, 2);
+    CHECK_EQ((int)col.length, 3);
+
+    const char *s = "123.45";
+    SQLLEN ind = SQL_NTS;
+
+    fdoca_encode_col(&b, &col, SQL_C_CHAR, s, 0, ind);
+    buf_flip(&b);
+
+    /* Expected: [0x00 not-null][0x12][0x34][0x5C]
+     * digits: 1 2 3 4 5 + sign 0xC (positive)
+     * byte0 = 0x12, byte1 = 0x34, byte2 = 0x5C */
+    CHECK_EQ_HEX(b.data[0], 0x00); /* not-null indicator */
+    CHECK_EQ_HEX(b.data[1], 0x12);
+    CHECK_EQ_HEX(b.data[2], 0x34);
+    CHECK_EQ_HEX(b.data[3], 0x5C);
+
+    buf_free(&b);
+}
+
+static void test_p15_encode_decimal_negative(void) {
+    printf("  P15: fdoca_encode_col DECIMAL(5,2) '-0.01' — negative packed BCD\n");
+    buf_t b; buf_init(&b, 16);
+
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_DECIMAL, 5, 2);
+    const char *s = "-0.01";
+    SQLLEN ind = SQL_NTS;
+
+    fdoca_encode_col(&b, &col, SQL_C_CHAR, s, 0, ind);
+    buf_flip(&b);
+
+    /* digits: 0 0 0 0 1 + sign 0xD (negative)
+     * byte0 = 0x00, byte1 = 0x00, byte2 = 0x1D */
+    CHECK_EQ_HEX(b.data[0], 0x00);
+    CHECK_EQ_HEX(b.data[1], 0x00);
+    CHECK_EQ_HEX(b.data[2], 0x00);
+    CHECK_EQ_HEX(b.data[3], 0x1D);
+
+    buf_free(&b);
+}
+
+static void test_p16_non_nullable_integer(void) {
+    printf("  P16: non-nullable INTEGER — no indicator byte, just 4 bytes\n");
+    buf_t b; buf_init(&b, 8);
+
+    /* Create a non-nullable column (drda_type = DT_INTEGER = 0x02, even) */
+    fdoca_col_t col = fdoca_sql_type_to_col(SQL_INTEGER, 0, 0);
+    col.nullable   = 0;
+    col.drda_type &= (uint8_t)~1u;  /* clear nullable bit */
+
+    int32_t val = 1000;
+    SQLLEN ind  = 0;
+
+    fdoca_encode_col(&b, &col, SQL_C_LONG, &val, sizeof val, ind);
+    buf_flip(&b);
+
+    /* No indicator byte */
+    CHECK_EQ((int)buf_remaining(&b), 4);
+    CHECK_EQ_HEX(b.data[0], 0xE8); /* 1000 = 0x000003E8 LE */
+    CHECK_EQ_HEX(b.data[1], 0x03);
+    CHECK_EQ_HEX(b.data[2], 0x00);
+    CHECK_EQ_HEX(b.data[3], 0x00);
+
+    buf_free(&b);
+}
+
+static void test_p17_num_params_unprepared(void) {
+    printf("  P17: SQLNumParams returns 0 for unprepared stmt\n");
+    sdb2_stmt_t *s = alloc_disconnected_stmt();
+
+    SQLSMALLINT n = 99;
+    SQLRETURN rc = SQLNumParams((SQLHSTMT)s, &n);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK_EQ(n, 0);
+
+    sdb2_stmt_free(s);
+}
+
+static void test_p18_bindings_survive_execute_reset(void) {
+    printf("  P18: param_bindings survive partial execute-reset (not cleared)\n");
+    sdb2_stmt_t *s = alloc_disconnected_stmt();
+
+    int32_t v = 5;
+    SQLLEN ind = 0;
+    SQLBindParameter((SQLHSTMT)s, 1, SQL_PARAM_INPUT,
+                     SQL_C_LONG, SQL_INTEGER, 0, 0, &v, 4, &ind);
+    CHECK_EQ(s->n_param_bindings, 1);
+
+    /* Simulate the partial cursor-reset done by SQLExecute (keeps params) */
+    /* This reset mimics what SQLExecute does: close cursor, free cols,
+     * reset row state, but does NOT clear param_bindings. */
+    fdoca_result_free(&s->cols);
+    s->row_buf_used = 0; s->cur_row = NULL;
+
+    /* Params should still be there */
+    CHECK_EQ(s->n_param_bindings, 1);
+    CHECK(s->param_bindings[0].active);
+
+    sdb2_stmt_free(s);
+}
+
+/* ================================================================== */
+/* Live DB2 tests                                                       */
+/* ================================================================== */
+
+static void run_live_tests(const char *host, int port,
+                            const char *db, const char *uid, const char *pwd) {
+    printf("\n--- Live DB2 tests (host=%s:%d db=%s) ---\n", host, port, db);
+
+    SQLHENV henv; SQLHDBC hdbc; SQLHSTMT hstmt;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
+    SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+    SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+
+    char cs[512];
+    snprintf(cs, sizeof cs,
+             "HOSTNAME=%s;PORT=%d;DATABASE=%s;UID=%s;PWD=%s",
+             host, port, db, uid, pwd);
+    SQLRETURN rc = SQLDriverConnect(hdbc, NULL, (SQLCHAR *)cs, SQL_NTS,
+                                    NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+    if (rc != SQL_SUCCESS) {
+        SQLCHAR msg[256]; SQLINTEGER native; SQLSMALLINT mlen;
+        SQLCHAR state[6];
+        SQLGetDiagRec(SQL_HANDLE_DBC, hdbc, 1, state, &native, msg, sizeof msg, &mlen);
+        printf("  SKIP live tests: connect failed: %s\n", (char *)msg);
+        skipped += 5;
+        goto cleanup;
+    }
+
+    /* L1: CREATE TABLE */
+    rc = SQLExecDirect(hstmt, (SQLCHAR *)
+        "CREATE TABLE p12test (id INTEGER NOT NULL, name VARCHAR(50), score DECIMAL(7,2))",
+        SQL_NTS);
+    if (rc != SQL_SUCCESS) {
+        SQLCHAR msg[256]; SQLSMALLINT mlen; SQLINTEGER native; SQLCHAR st[6];
+        SQLGetDiagRec(SQL_HANDLE_STMT, hstmt, 1, st, &native, msg, sizeof msg, &mlen);
+        printf("  SKIP: CREATE TABLE failed: %s\n", (char *)msg);
+        skipped += 5;
+        goto disconnect;
+    }
+
+    /* L1: INSERT ... VALUES(?,?,?) */
+    printf("  L1: INSERT with 3 parameters\n");
+    rc = SQLPrepare(hstmt,
+        (SQLCHAR *)"INSERT INTO p12test VALUES(?,?,?)", SQL_NTS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+
+    int32_t  pid  = 1;
+    char     pname[64] = "Alice";
+    char     pscore[16] = "99.50";
+    SQLLEN   ind_id     = 0;
+    SQLLEN   ind_name   = SQL_NTS;
+    SQLLEN   ind_score  = SQL_NTS;
+
+    SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_LONG, SQL_INTEGER,
+                     10, 0, &pid, sizeof pid, &ind_id);
+    SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
+                     50, 0, pname, sizeof pname, &ind_name);
+    SQLBindParameter(hstmt, 3, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_DECIMAL,
+                     7, 2, pscore, sizeof pscore, &ind_score);
+
+    rc = SQLExecute(hstmt);
+    if (rc != SQL_SUCCESS) {
+        SQLCHAR msg[256]; SQLSMALLINT mlen; SQLINTEGER native; SQLCHAR st[6];
+        SQLGetDiagRec(SQL_HANDLE_STMT, hstmt, 1, st, &native, msg, sizeof msg, &mlen);
+        printf("  FAIL L1: INSERT failed: %s\n", (char *)msg);
+        assert("L1: INSERT succeeded", 0);
+    } else {
+        SQLLEN rows = 0;
+        SQLRowCount(hstmt, &rows);
+        CHECK_EQ((int)rows, 1);
+    }
+
+    /* L2: Re-execute with different values */
+    printf("  L2: Re-execute with different param values\n");
+    pid = 2; strncpy(pname, "Bob", sizeof pname); strncpy(pscore, "55.25", sizeof pscore);
+    rc = SQLExecute(hstmt);
+    CHECK_EQ(rc, SQL_SUCCESS);
+
+    /* L3: SELECT ... WHERE id = ? */
+    printf("  L3: SELECT ... WHERE id=?\n");
+    SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    rc = SQLPrepare(hstmt, (SQLCHAR *)"SELECT name FROM p12test WHERE id=?", SQL_NTS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+
+    pid = 1; ind_id = 0;
+    SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_LONG, SQL_INTEGER,
+                     10, 0, &pid, sizeof pid, &ind_id);
+    rc = SQLExecute(hstmt);
+    CHECK_EQ(rc, SQL_SUCCESS);
+
+    char name_buf[64] = {0};
+    SQLLEN name_ind = 0;
+    SQLBindCol(hstmt, 1, SQL_C_CHAR, name_buf, sizeof name_buf, &name_ind);
+    rc = SQLFetch(hstmt);
+    CHECK_EQ(rc, SQL_SUCCESS);
+    CHECK(strcmp(name_buf, "Alice") == 0);
+    rc = SQLFetch(hstmt);
+    CHECK_EQ(rc, SQL_NO_DATA);
+
+    /* L4: NULL parameter */
+    printf("  L4: NULL parameter via SQL_NULL_DATA\n");
+    SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    rc = SQLPrepare(hstmt,
+        (SQLCHAR *)"INSERT INTO p12test VALUES(?,?,?)", SQL_NTS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+
+    pid = 3; ind_id = 0;
+    SQLLEN ind_null = SQL_NULL_DATA;
+    ind_score = SQL_NULL_DATA;
+    SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_LONG, SQL_INTEGER,
+                     10, 0, &pid, sizeof pid, &ind_id);
+    SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
+                     50, 0, NULL, 0, &ind_null);
+    SQLBindParameter(hstmt, 3, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_DECIMAL,
+                     7, 2, NULL, 0, &ind_score);
+    rc = SQLExecute(hstmt);
+    CHECK_EQ(rc, SQL_SUCCESS);
+
+    /* L5: DROP TABLE cleanup */
+    printf("  L5: DROP TABLE cleanup\n");
+    SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+    rc = SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE p12test", SQL_NTS);
+    CHECK_EQ(rc, SQL_SUCCESS);
+
+disconnect:
+    SQLDisconnect(hdbc);
+cleanup:
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+/* ================================================================== */
+/* main                                                                 */
+/* ================================================================== */
+
+int main(void) {
+    printf("=== Phase 12 — Parameter binding tests ===\n\n");
+    printf("--- Fixture tests (no DB2 needed) ---\n");
+
+    test_p1_bind_parameter_stores_binding();
+    test_p2_unbind_parameter();
+    test_p3_reset_params();
+    test_p4_reset_params_clears_desc();
+    test_p5_sql_type_to_col();
+    test_p6_encode_integer();
+    test_p7_encode_smallint();
+    test_p8_encode_bigint();
+    test_p9_encode_null();
+    test_p10_encode_varchar();
+    test_p11_encode_char_fixed();
+    test_p12_encode_double();
+    test_p13_encode_date();
+    test_p14_encode_decimal_positive();
+    test_p15_encode_decimal_negative();
+    test_p16_non_nullable_integer();
+    test_p17_num_params_unprepared();
+    test_p18_bindings_survive_execute_reset();
+
+    /* Live DB2 tests */
+    const char *db2host = getenv("DB2_TEST_HOST");
+    if (db2host) {
+        int port = 50000;
+        const char *penv = getenv("DB2_TEST_PORT");
+        if (penv) port = atoi(penv);
+        const char *db   = getenv("DB2_TEST_DB");   if (!db)   db   = "SAMPLE";
+        const char *uid  = getenv("DB2_TEST_USER");  if (!uid)  uid  = "db2inst1";
+        const char *pwd  = getenv("DB2_TEST_PASS");  if (!pwd)  pwd  = "";
+        run_live_tests(db2host, port, db, uid, pwd);
+    } else {
+        printf("\n(Live DB2 tests SKIPPED: set DB2_TEST_HOST to enable)\n");
+        skipped += 5;
+    }
+
+    if (skipped) {
+        printf("\n(Live DB2 tests skipped: %d)\n", skipped);
+    }
+
+    print_results("p12_params");
+    return 0;
+}

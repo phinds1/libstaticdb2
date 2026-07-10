@@ -1,0 +1,98 @@
+/* Phase 9 — database.env loading + exit code truth table */
+#include <stdio.h>
+#include <string.h>
+#include "../src/args.h"
+#include "../src/engine.h"
+
+static int failed = 0;
+static int passed = 0;
+
+#define CHECK(expr) \
+    do { if (!(expr)) { \
+        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
+    } else { passed++; } } while(0)
+#define CHECK_EQ(a,b) \
+    do { if ((a)!=(b)) { \
+        printf("  FAIL [%d]: %d != %d\n", __LINE__, (int)(a),(int)(b)); \
+        failed++; \
+    } else { passed++; } } while(0)
+#define CHECK_STR(a,b) \
+    do { if (strcmp((a),(b))!=0) { \
+        printf("  FAIL [%d]: '%s' != '%s'\n", __LINE__, (a),(b)); \
+        failed++; \
+    } else { passed++; } } while(0)
+
+/* Pure exit-code computation (mirrors main.c logic) */
+static int compute_exit_code(const engine_result_t *res, int script_mode) {
+    (void)script_mode; /* same logic in both modes; -x just suppresses output */
+    return (res->failed > 0) ? 1 : 0;
+}
+
+static void test_env_load(void) {
+    printf("  T1: args_load_env populates fields from fixtures/database.env\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    int r = args_load_env("fixtures/database.env", &a);
+    CHECK_EQ(r, 0);
+    CHECK_STR(a.host, "testhost");
+    CHECK_EQ(a.port, 50000);
+    CHECK_STR(a.database, "ENVDB");
+    CHECK_STR(a.user, "envuser");
+    CHECK_STR(a.password, "envpass");
+    CHECK_EQ(a.continue_on_error, 1);
+    CHECK_EQ(a.script_mode, 1);
+}
+
+static void test_env_not_override(void) {
+    printf("  T2: CLI flags win over database.env (call load_env first, then parse)\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    /* Load env file first */
+    args_load_env("fixtures/database.env", &a);
+    /* Then CLI parse overwrites */
+    char *argv[] = {"db2delta", "-d", "clihost/CLIDB", "-u", "cliuser",
+                    "-p", "clipass", "-V", NULL};
+    CHECK_EQ(args_parse(8, argv, &a), 0);
+    CHECK_STR(a.host, "clihost");
+    CHECK_STR(a.database, "CLIDB");
+    CHECK_STR(a.user, "cliuser");
+    CHECK_STR(a.password, "clipass");
+    /* script_mode and continue_on_error from env not overridden — still 1 */
+    CHECK_EQ(a.continue_on_error, 1);
+    CHECK_EQ(a.script_mode, 1);
+}
+
+static void test_exit_codes(void) {
+    printf("  T3: compute_exit_code truth table\n");
+
+    /* all ok → 0 */
+    engine_result_t r0 = {3, 1, 0};
+    CHECK_EQ(compute_exit_code(&r0, 0), 0);
+    CHECK_EQ(compute_exit_code(&r0, 1), 0);
+
+    /* one failed → 1 */
+    engine_result_t r1 = {1, 0, 1};
+    CHECK_EQ(compute_exit_code(&r1, 0), 1);
+    CHECK_EQ(compute_exit_code(&r1, 1), 1);
+
+    /* idempotent skip only (applied=0, failed=0) → 0 */
+    engine_result_t r2 = {0, 5, 0};
+    CHECK_EQ(compute_exit_code(&r2, 0), 0);
+    CHECK_EQ(compute_exit_code(&r2, 1), 0);
+}
+
+static void test_env_absent(void) {
+    printf("  T4: args_load_env on nonexistent file → returns -1, no crash\n");
+    db2delta_args_t a; memset(&a, 0, sizeof(a));
+    int r = args_load_env("/nonexistent/database.env", &a);
+    CHECK_EQ(r, -1);
+    CHECK_EQ(a.host[0], '\0'); /* nothing populated */
+}
+
+int main(void) {
+    printf("=== Phase 9 — database.env + exit codes ===\n\n");
+    test_env_load();
+    test_env_not_override();
+    test_exit_codes();
+    test_env_absent();
+    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
+    return failed ? 1 : 0;
+}

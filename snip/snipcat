@@ -1,0 +1,27 @@
+#!/bin/bash
+#
+# Snip Cat - Cat a delimeted snip out of a file
+#
+
+tag=$1
+file=$2
+
+if [[ -z "$tag" ]] || [[ -z "$file" ]]
+then
+    echo "Usage: $0 SNIP_TAG file"
+    exit 1
+fi
+
+cat $file | awk -v TAG="$tag" '
+BEGIN {
+    doecho=0;
+}
+/.*/ {
+    if (match($0, TAG)) {
+        if (!doecho) doecho=1;
+        else doecho=0;
+        next;
+    }
+    if (doecho) print $0;
+}
+'

@@ -1,0 +1,162 @@
+/* db2delta integration tests — require DB2_TEST_HOST to be set.
+ * Grows phase by phase.  Skips cleanly when DB2_TEST_HOST is unset.
+ *
+ * Current coverage:
+ *   I1.  conn_open + conn_server_version + conn_close
+ *   I2.  -V mode end-to-end via engine
+ *   I3.  -q mode: SELECT from SYSIBM.SYSDUMMY1
+ *   I4.  engine_apply: apply sample.delta (first run)
+ *   I5.  engine_apply: re-apply sample.delta (idempotent)
+ *   I6.  changelog row present after apply
+ */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "../src/args.h"
+#include "../src/conn.h"
+#include "../src/engine.h"
+#include "../src/changelog.h"
+
+static int failed = 0;
+static int passed = 0;
+
+#define CHECK(expr) \
+    do { if (!(expr)) { \
+        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
+    } else { passed++; } } while(0)
+
+static db2delta_args_t build_args(const char *host, int port,
+                                   const char *db, const char *uid,
+                                   const char *pwd) {
+    db2delta_args_t a;
+    memset(&a, 0, sizeof(a));
+    strncpy(a.host,     host, sizeof(a.host) - 1);
+    a.port = port;
+    strncpy(a.database, db,   sizeof(a.database) - 1);
+    strncpy(a.user,     uid,  sizeof(a.user) - 1);
+    strncpy(a.password, pwd,  sizeof(a.password) - 1);
+    return a;
+}
+
+int main(void) {
+    printf("=== db2delta integration tests ===\n");
+
+    const char *host = getenv("DB2_TEST_HOST");
+    if (!host) {
+        printf("\nSKIPPED: set DB2_TEST_HOST to run integration tests.\n");
+        return 0;
+    }
+    const char *port_s = getenv("DB2_TEST_PORT");
+    const char *db     = getenv("DB2_TEST_DB");
+    const char *uid    = getenv("DB2_TEST_USER");
+    const char *pwd    = getenv("DB2_TEST_PASS");
+    int port = port_s ? atoi(port_s) : 50000;
+    if (!db)  db  = "TESTDB";
+    if (!uid) uid = "db2inst1";
+    if (!pwd) pwd = "db2inst1";
+
+    db2delta_args_t args = build_args(host, port, db, uid, pwd);
+
+    /* I1: connect + version */
+    printf("\n  I1: conn_open + conn_server_version\n");
+    db2delta_conn_t conn;
+    int r = conn_open(&conn, &args);
+    CHECK(r == 0);
+    if (r == 0) {
+        char ver[256] = {0};
+        int vr = conn_server_version(&conn, ver, sizeof(ver));
+        CHECK(vr == 0);
+        CHECK(ver[0] != '\0');
+        printf("    version: %s\n", ver);
+        conn_close(&conn);
+    }
+
+    /* I2: conn_exec — SELECT 1 */
+    printf("\n  I2: conn_exec SELECT 1\n");
+    r = conn_open(&conn, &args);
+    CHECK(r == 0);
+    if (r == 0) {
+        int er = conn_exec(&conn, "SELECT 1 FROM SYSIBM.SYSDUMMY1");
+        CHECK(er == 0);
+        conn_close(&conn);
+    }
+
+    /* I3: engine_query */
+    printf("\n  I3: engine_query SELECT 1\n");
+    {
+        r = conn_open(&conn, &args);
+        CHECK(r == 0);
+        if (r == 0) {
+            int qr = engine_query(&conn, "SELECT 1 FROM SYSIBM.SYSDUMMY1", 0);
+            CHECK(qr == 0);
+            conn_close(&conn);
+        }
+    }
+
+    /* I4: clean up previous test run's changelog row (ignore errors) */
+    r = conn_open(&conn, &args);
+    if (r == 0) {
+        conn_exec(&conn, "DELETE FROM DBDELTA_CHANGELOG WHERE CHANGESET='create_users_table'");
+        conn_exec(&conn, "DROP TABLE users");
+        conn_close(&conn);
+    }
+
+    /* I5: engine_apply — first run of test fixture */
+    printf("\n  I4: engine_apply sample.delta (first run)\n");
+    {
+        args.sql_file_count = 1;
+        args.sql_files[0] = "test/fixtures/sample.delta";
+        args.mode = MODE_APPLY;
+        engine_result_t result;
+        memset(&result, 0, sizeof(result));
+        r = conn_open(&conn, &args);
+        CHECK(r == 0);
+        if (r == 0) {
+            int ar = engine_apply(&conn, &args, &result);
+            CHECK(ar == 0);
+            CHECK(result.applied == 1);
+            CHECK(result.failed == 0);
+            conn_close(&conn);
+        }
+    }
+
+    /* I6: engine_apply — idempotent second run */
+    printf("\n  I5: engine_apply sample.delta (idempotent)\n");
+    {
+        engine_result_t result;
+        memset(&result, 0, sizeof(result));
+        r = conn_open(&conn, &args);
+        CHECK(r == 0);
+        if (r == 0) {
+            int ar = engine_apply(&conn, &args, &result);
+            CHECK(ar == 0);
+            CHECK(result.skipped == 1);
+            CHECK(result.failed == 0);
+            conn_close(&conn);
+        }
+    }
+
+    /* I6: verify changelog row exists */
+    printf("\n  I6: changelog row present\n");
+    r = conn_open(&conn, &args);
+    CHECK(r == 0);
+    if (r == 0) {
+        int present = 0;
+        int hr = changelog_has(&conn, "create_users_table", &present);
+        CHECK(hr == 0);
+        CHECK(present == 1);
+        conn_close(&conn);
+    }
+
+    /* cleanup */
+    r = conn_open(&conn, &args);
+    if (r == 0) {
+        conn_exec(&conn, "DELETE FROM DBDELTA_CHANGELOG WHERE CHANGESET='create_users_table'");
+        conn_exec(&conn, "DROP TABLE users");
+        conn_close(&conn);
+    }
+
+    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
+    return failed ? 1 : 0;
+}

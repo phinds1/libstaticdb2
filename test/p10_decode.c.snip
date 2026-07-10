@@ -1,0 +1,452 @@
+/* Phase 10 — column value decoding tests
+ *
+ * Tests fdoca_decode_col() for all supported types and sdb2_stmt_get_col()
+ * on a hand-built multi-column row buffer.
+ *
+ * All wire data is little-endian per QTDSQLASC (DB2 ASCII agent format).
+ * Date/Time/Timestamp are ASCII ISO strings.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+#include "fdoca.h"
+#include "handles.h"
+#include "asserts.h"
+
+
+/* ------------------------------------------------------------------ */
+/* Helper: build a minimal fdoca_col_t for a non-nullable type.       */
+/* ------------------------------------------------------------------ */
+static fdoca_col_t make_col(uint8_t drda_type, uint16_t length,
+                             uint8_t precision, uint8_t scale, uint16_t ccsid) {
+    fdoca_col_t c;
+    memset(&c, 0, sizeof c);
+    c.drda_type = drda_type;
+    c.length    = length;
+    c.precision = precision;
+    c.scale     = scale;
+    c.ccsid     = ccsid;
+    c.nullable  = drda_type & 1u;
+    c.sdb2_type = fdoca_drda_to_sdb2(drda_type);
+    return c;
+}
+
+/* ---- BOOL ---- */
+static void test_bool(void) {
+    fdoca_col_t col = make_col(0xBE, 1, 0, 0, 0); /* not nullable */
+    uint8_t data[] = { 0x01 };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_BOOL);
+    CHECK(!v.is_null);
+    CHECK(v.v.b == 1);
+
+    data[0] = 0x00;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.v.b == 0);
+}
+
+/* ---- SMALLINT ---- */
+static void test_smallint(void) {
+    fdoca_col_t col = make_col(0x04, 2, 0, 0, 0); /* not nullable */
+    /* +1234 little-endian: 0xD2 0x04 */
+    uint8_t data[] = { 0xD2, 0x04 };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_INT16);
+    CHECK(!v.is_null);
+    CHECK(v.v.i16 == 1234);
+
+    /* -1 */
+    uint8_t neg[] = { 0xFF, 0xFF };
+    CHECK(fdoca_decode_col(&col, neg, sizeof neg, &v) == SDB2_OK);
+    CHECK(v.v.i16 == -1);
+}
+
+/* ---- INTEGER ---- */
+static void test_integer(void) {
+    fdoca_col_t col = make_col(0x02, 4, 0, 0, 0);
+    /* 123456789 = 0x075BCD15, little-endian: 0x15, 0xCD, 0x5B, 0x07 */
+    uint8_t data[] = { 0x15, 0xCD, 0x5B, 0x07 };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_INT32);
+    CHECK(v.v.i32 == 123456789);
+
+    /* -1 */
+    uint8_t neg[] = { 0xFF, 0xFF, 0xFF, 0xFF };
+    CHECK(fdoca_decode_col(&col, neg, sizeof neg, &v) == SDB2_OK);
+    CHECK(v.v.i32 == -1);
+}
+
+/* ---- BIGINT ---- */
+static void test_bigint(void) {
+    fdoca_col_t col = make_col(0x16, 8, 0, 0, 0);
+    /* 1 = little-endian: 0x01 then 7 zero bytes */
+    uint8_t data[] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_INT64);
+    CHECK(v.v.i64 == 1LL);
+
+    /* -1 */
+    uint8_t neg[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    CHECK(fdoca_decode_col(&col, neg, sizeof neg, &v) == SDB2_OK);
+    CHECK(v.v.i64 == -1LL);
+}
+
+/* ---- FLOAT(4) ---- */
+static void test_float32(void) {
+    fdoca_col_t col = make_col(0x0C, 4, 0, 0, 0);
+    /* IEEE 754 1.5f = 0x3FC00000, little-endian: 0x00, 0x00, 0xC0, 0x3F */
+    uint8_t data[] = { 0x00, 0x00, 0xC0, 0x3F };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_FLOAT32);
+    CHECK(fabsf(v.v.f32 - 1.5f) < 1e-6f);
+}
+
+/* ---- FLOAT(8) / DOUBLE ---- */
+static void test_float64(void) {
+    fdoca_col_t col = make_col(0x0A, 8, 0, 0, 0);
+    /* IEEE 754 3.14159265358979 ≈ 0x400921FB54442D18, little-endian */
+    uint8_t data[] = { 0x18, 0x2D, 0x44, 0x54, 0xFB, 0x21, 0x09, 0x40 };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_FLOAT64);
+    CHECK(fabs(v.v.f64 - 3.14159265358979) < 1e-10);
+}
+
+/* ---- DECIMAL packed BCD ---- */
+static void test_decimal(void) {
+    /* DECIMAL(7,2) = 123.45
+     * precision=7, packed bytes = (7+2)/2 = 4
+     * digits: 0 0 1 2 3 4 5 sign=C
+     * bytes: 0x00 0x12 0x34 0x5C */
+    fdoca_col_t col = make_col(0x0E, 4, 7, 2, 0); /* not nullable */
+    uint8_t data[] = { 0x00, 0x12, 0x34, 0x5C };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_DECIMAL);
+    CHECK(!v.is_null);
+    CHECK(strcmp(v.v.str.data, "123.45") == 0);
+
+    /* -123.45: sign nibble = D */
+    uint8_t neg[] = { 0x00, 0x12, 0x34, 0x5D };
+    CHECK(fdoca_decode_col(&col, neg, sizeof neg, &v) == SDB2_OK);
+    CHECK(strcmp(v.v.str.data, "-123.45") == 0);
+
+    /* 0.00 (all zeros, positive) */
+    uint8_t zero[] = { 0x00, 0x00, 0x00, 0x0C };
+    CHECK(fdoca_decode_col(&col, zero, sizeof zero, &v) == SDB2_OK);
+    CHECK(strcmp(v.v.str.data, "0.00") == 0);
+
+    /* DECIMAL(5,0) integer: scale=0 → no decimal point
+     * value = 99999, bytes = (5+2)/2 = 3
+     * digits: 9 9 9 9 9 sign=C
+     * bytes: 0x99 0x99 0x9C */
+    fdoca_col_t col2 = make_col(0x0E, 3, 5, 0, 0);
+    uint8_t int_data[] = { 0x99, 0x99, 0x9C };
+    CHECK(fdoca_decode_col(&col2, int_data, sizeof int_data, &v) == SDB2_OK);
+    CHECK(strcmp(v.v.str.data, "99999") == 0);
+}
+
+/* ---- DATE ---- */
+static void test_date(void) {
+    fdoca_col_t col = make_col(0x20, 10, 0, 0, 0);
+    /* "2024-07-09" in ASCII */
+    uint8_t data[] = { '2','0','2','4','-','0','7','-','0','9' };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_DATE);
+    CHECK(strcmp(v.v.str.data, "2024-07-09") == 0);
+    CHECK(v.v.str.len == 10);
+}
+
+/* ---- TIME ---- */
+static void test_time(void) {
+    fdoca_col_t col = make_col(0x22, 8, 0, 0, 0);
+    uint8_t data[] = { '1','4',':','3','0',':','0','0' };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_TIME);
+    CHECK(strcmp(v.v.str.data, "14:30:00") == 0);
+}
+
+/* ---- TIMESTAMP ---- */
+static void test_timestamp(void) {
+    fdoca_col_t col = make_col(0x24, 26, 0, 0, 0);
+    /* "2024-07-09-14.30.00.000000" (26 bytes) */
+    const char *ts = "2024-07-09-14.30.00.000000";
+    uint8_t data[26];
+    memcpy(data, ts, 26);
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_TIMESTAMP);
+    CHECK(strcmp(v.v.str.data, ts) == 0);
+    CHECK(v.v.str.len == 26);
+}
+
+/* ---- CHAR (fixed length) ---- */
+static void test_char(void) {
+    fdoca_col_t col = make_col(0x30, 5, 0, 0, 1208); /* CCSID 1208 = UTF-8 */
+    uint8_t data[] = { 'H','e','l','l','o' };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_CHAR);
+    CHECK(v.v.str.len == 5);
+    CHECK(memcmp(v.v.str.data, "Hello", 5) == 0);
+}
+
+/* ---- VARCHAR (2-byte length prefix) ---- */
+static void test_varchar(void) {
+    fdoca_col_t col = make_col(0x32, 100, 0, 0, 1208);
+    /* "Hi" — 2-byte BE length 2, then data */
+    uint8_t data[] = { 0x00, 0x02, 'H', 'i' };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_VARCHAR);
+    CHECK(v.v.str.len == 2);
+    CHECK(memcmp(v.v.str.data, "Hi", 2) == 0);
+
+    /* Empty string */
+    uint8_t empty[] = { 0x00, 0x00 };
+    CHECK(fdoca_decode_col(&col, empty, sizeof empty, &v) == SDB2_OK);
+    CHECK(v.v.str.len == 0);
+}
+
+/* ---- BINARY (fixed) ---- */
+static void test_binary(void) {
+    fdoca_col_t col = make_col(0x26, 3, 0, 0, 0);
+    uint8_t data[] = { 0xDE, 0xAD, 0xBE };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_BINARY);
+    CHECK(v.v.str.len == 3);
+    CHECK((uint8_t)v.v.str.data[0] == 0xDE);
+    CHECK((uint8_t)v.v.str.data[1] == 0xAD);
+    CHECK((uint8_t)v.v.str.data[2] == 0xBE);
+}
+
+/* ---- VARBINARY ---- */
+static void test_varbinary(void) {
+    fdoca_col_t col = make_col(0x28, 10, 0, 0, 0);
+    /* 2-byte BE length then data */
+    uint8_t data[] = { 0x00, 0x02, 0xCA, 0xFE };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_VARBINARY);
+    CHECK(v.v.str.len == 2);
+    CHECK((uint8_t)v.v.str.data[0] == 0xCA);
+    CHECK((uint8_t)v.v.str.data[1] == 0xFE);
+}
+
+/* ---- NULL handling ---- */
+static void test_nulls(void) {
+    sdb2_value_t v;
+
+    /* Nullable INTEGER NULL: null-indicator = 0xFF */
+    fdoca_col_t col_int = make_col(0x03, 4, 0, 0, 0); /* nullable INTEGER */
+    uint8_t null_data[] = { 0xFF };
+    CHECK(fdoca_decode_col(&col_int, null_data, sizeof null_data, &v) == SDB2_OK);
+    CHECK(v.is_null == 1);
+    CHECK(v.type == SDB2_C_INT32);
+
+    /* Nullable INTEGER NOT NULL: indicator = 0x00, then LE value 7 */
+    uint8_t nonnull[] = { 0x00, 0x07, 0x00, 0x00, 0x00 };
+    CHECK(fdoca_decode_col(&col_int, nonnull, sizeof nonnull, &v) == SDB2_OK);
+    CHECK(!v.is_null);
+    CHECK(v.v.i32 == 7);
+
+    /* Nullable VARCHAR NULL */
+    fdoca_col_t col_vc = make_col(0x33, 50, 0, 0, 1208);
+    CHECK(fdoca_decode_col(&col_vc, null_data, sizeof null_data, &v) == SDB2_OK);
+    CHECK(v.is_null == 1);
+    CHECK(v.type == SDB2_C_VARCHAR);
+
+    /* Nullable DECIMAL(7,2) NULL */
+    fdoca_col_t col_dec = make_col(0x0F, 4, 7, 2, 0);
+    CHECK(fdoca_decode_col(&col_dec, null_data, sizeof null_data, &v) == SDB2_OK);
+    CHECK(v.is_null == 1);
+}
+
+/* ---- fdoca_col_wire_size ---- */
+static void test_wire_size(void) {
+    /* Fixed-length types */
+    fdoca_col_t c;
+
+    c = make_col(0x02, 4, 0, 0, 0); /* INTEGER */
+    CHECK(fdoca_col_wire_size(&c, NULL, 0) == 4);
+
+    c = make_col(0x16, 8, 0, 0, 0); /* BIGINT */
+    CHECK(fdoca_col_wire_size(&c, NULL, 0) == 8);
+
+    c = make_col(0x20, 10, 0, 0, 0); /* DATE */
+    CHECK(fdoca_col_wire_size(&c, NULL, 0) == 10);
+
+    c = make_col(0x0E, 4, 7, 2, 0); /* DECIMAL(7,2): 4 BCD bytes */
+    CHECK(fdoca_col_wire_size(&c, NULL, 0) == 4);
+
+    /* VARCHAR: reads 2-byte BE length prefix */
+    c = make_col(0x32, 100, 0, 0, 0);
+    uint8_t vd[] = { 0x00, 0x05, 'A','B','C','D','E' };
+    CHECK(fdoca_col_wire_size(&c, vd, sizeof vd) == 7); /* 2 + 5 */
+
+    /* VARBINARY empty */
+    c = make_col(0x28, 20, 0, 0, 0);
+    uint8_t vb[] = { 0x00, 0x00 };
+    CHECK(fdoca_col_wire_size(&c, vb, sizeof vb) == 2);
+}
+
+/* ---- Multi-column row: sdb2_stmt_get_col ---- */
+static void test_get_col(void) {
+    /*
+     * Row format (not nullable columns, QTDSQLASC):
+     *   col0: INTEGER   4 bytes  value = 42        → 0x2A 0x00 0x00 0x00 (LE)
+     *   col1: SMALLINT  2 bytes  value = -5         → 0xFB 0xFF (LE)
+     *   col2: VARCHAR   2+3 = 5  value = "abc"      → 0x00 0x03 'a' 'b' 'c' (BE length)
+     *   col3: DATE      10 bytes value = "2024-01-01"
+     */
+    static const uint8_t row[] = {
+        0x2A, 0x00, 0x00, 0x00,               /* INTEGER 42 LE */
+        0xFB, 0xFF,                            /* SMALLINT -5 LE */
+        0x00, 0x03, 'a', 'b', 'c',            /* VARCHAR "abc" BE length */
+        '2','0','2','4','-','0','1','-','0','1' /* DATE */
+    };
+
+    /* Build a minimal stmt with the column descriptors */
+    sdb2_env_t  *env  = sdb2_env_alloc();
+    sdb2_dbc_t  *dbc  = sdb2_dbc_alloc(env);
+    sdb2_stmt_t *stmt = sdb2_stmt_alloc(dbc);
+
+    /* Set up col descriptors manually */
+    stmt->cols.cols = (fdoca_col_t *)calloc(4, sizeof(fdoca_col_t));
+    stmt->cols.ncols = 4;
+    stmt->cols.cols[0] = make_col(0x02, 4,  0, 0, 0);      /* INTEGER  */
+    stmt->cols.cols[1] = make_col(0x04, 2,  0, 0, 0);      /* SMALLINT */
+    stmt->cols.cols[2] = make_col(0x32, 50, 0, 0, 1208);   /* VARCHAR  */
+    stmt->cols.cols[3] = make_col(0x20, 10, 0, 0, 0);      /* DATE     */
+
+    /* Simulate drda_fetch having set cur_row */
+    stmt->cur_row     = row;
+    stmt->cur_row_len = sizeof row;
+
+    sdb2_value_t v;
+
+    /* col0: INTEGER 42 */
+    CHECK(sdb2_stmt_get_col(stmt, 0, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_INT32 && !v.is_null && v.v.i32 == 42);
+
+    /* col1: SMALLINT -5 */
+    CHECK(sdb2_stmt_get_col(stmt, 1, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_INT16 && !v.is_null && v.v.i16 == -5);
+
+    /* col2: VARCHAR "abc" */
+    CHECK(sdb2_stmt_get_col(stmt, 2, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_VARCHAR && !v.is_null && v.v.str.len == 3);
+    CHECK(memcmp(v.v.str.data, "abc", 3) == 0);
+
+    /* col3: DATE */
+    CHECK(sdb2_stmt_get_col(stmt, 3, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_DATE && !v.is_null);
+    CHECK(strcmp(v.v.str.data, "2024-01-01") == 0);
+
+    /* Out-of-range index */
+    CHECK(sdb2_stmt_get_col(stmt, 4, &v) == SDB2_ERR_BADARG);
+    CHECK(sdb2_stmt_get_col(stmt, -1, &v) == SDB2_ERR_BADARG);
+
+    /* No current row */
+    stmt->cur_row = NULL;
+    CHECK(sdb2_stmt_get_col(stmt, 0, &v) == SDB2_ERR_NODATA);
+
+    free(stmt->cols.cols);
+    stmt->cols.cols  = NULL;
+    stmt->cols.ncols = 0;
+    sdb2_stmt_free(stmt);
+    sdb2_dbc_free(dbc);
+    sdb2_env_free(env);
+}
+
+/* ---- Multi-column row with nullable columns ---- */
+static void test_get_col_nullable(void) {
+    /*
+     * Row: nullable SMALLINT (NULL), nullable INTEGER (42).
+     * Wire: [0xFF] [0x00 0x2A 0x00 0x00 0x00]  (LE integer)
+     */
+    static const uint8_t row[] = {
+        0xFF,                          /* nullable SMALLINT → NULL */
+        0x00, 0x2A, 0x00, 0x00, 0x00  /* nullable INTEGER non-null, value=42 LE */
+    };
+
+    sdb2_env_t  *env  = sdb2_env_alloc();
+    sdb2_dbc_t  *dbc  = sdb2_dbc_alloc(env);
+    sdb2_stmt_t *stmt = sdb2_stmt_alloc(dbc);
+
+    stmt->cols.cols  = (fdoca_col_t *)calloc(2, sizeof(fdoca_col_t));
+    stmt->cols.ncols = 2;
+    stmt->cols.cols[0] = make_col(0x05, 2, 0, 0, 0); /* nullable SMALLINT */
+    stmt->cols.cols[1] = make_col(0x03, 4, 0, 0, 0); /* nullable INTEGER  */
+
+    stmt->cur_row     = row;
+    stmt->cur_row_len = sizeof row;
+
+    sdb2_value_t v;
+
+    CHECK(sdb2_stmt_get_col(stmt, 0, &v) == SDB2_OK);
+    CHECK(v.is_null == 1);
+
+    CHECK(sdb2_stmt_get_col(stmt, 1, &v) == SDB2_OK);
+    CHECK(!v.is_null && v.v.i32 == 42);
+
+    free(stmt->cols.cols);
+    stmt->cols.cols  = NULL;
+    stmt->cols.ncols = 0;
+    sdb2_stmt_free(stmt);
+    sdb2_dbc_free(dbc);
+    sdb2_env_free(env);
+}
+
+/* ---- NEED_MORE on truncated buffer ---- */
+static void test_need_more(void) {
+    fdoca_col_t col = make_col(0x02, 4, 0, 0, 0); /* INTEGER */
+    uint8_t short_data[] = { 0x00, 0x00 };        /* only 2 bytes, need 4 */
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, short_data, sizeof short_data, &v) == SDB2_NEED_MORE);
+
+    /* Truncated nullable column: only null indicator, no value */
+    col = make_col(0x03, 4, 0, 0, 0); /* nullable INTEGER */
+    uint8_t nn[] = { 0x00 };          /* not-null indicator, but no value bytes */
+    CHECK(fdoca_decode_col(&col, nn, sizeof nn, &v) == SDB2_NEED_MORE);
+
+    /* Empty buffer for nullable */
+    CHECK(fdoca_decode_col(&col, NULL, 0, &v) == SDB2_NEED_MORE);
+}
+
+int main(void) {
+    test_bool();
+    test_smallint();
+    test_integer();
+    test_bigint();
+    test_float32();
+    test_float64();
+    test_decimal();
+    test_date();
+    test_time();
+    test_timestamp();
+    test_char();
+    test_varchar();
+    test_binary();
+    test_varbinary();
+    test_nulls();
+    test_wire_size();
+    test_get_col();
+    test_get_col_nullable();
+    test_need_more();
+
+    print_results("p10_decode");
+    return 0;
+}

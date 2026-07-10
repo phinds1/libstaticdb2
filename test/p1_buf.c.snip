@@ -1,0 +1,149 @@
+/* Phase 1 — buf round-trip test + net error-path smoke test */
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "../src/buf.h"
+#include "../src/net.h"
+#include "../include/staticdb2/sdb2.h"
+#include "asserts.h"
+
+
+/* ---- buf scalar round-trip ---- */
+static void test_scalars(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 16) == SDB2_OK);
+
+    CHECK(buf_put_u8 (&b, 0xAB)                   == SDB2_OK);
+    CHECK(buf_put_u16(&b, 0x1234)                  == SDB2_OK);
+    CHECK(buf_put_u24(&b, 0xABCDEF)                == SDB2_OK);
+    CHECK(buf_put_u32(&b, 0xDEADBEEFUL)            == SDB2_OK);
+    CHECK(buf_put_u64(&b, 0x0102030405060708ULL)   == SDB2_OK);
+
+    buf_flip(&b);
+
+    uint8_t  v8;
+    uint16_t v16;
+    uint32_t v24, v32;
+    uint64_t v64;
+
+    CHECK(buf_get_u8 (&b, &v8)  == SDB2_OK && v8  == 0xAB);
+    CHECK(buf_get_u16(&b, &v16) == SDB2_OK && v16 == 0x1234);
+    CHECK(buf_get_u24(&b, &v24) == SDB2_OK && v24 == 0xABCDEF);
+    CHECK(buf_get_u32(&b, &v32) == SDB2_OK && v32 == 0xDEADBEEFUL);
+    CHECK(buf_get_u64(&b, &v64) == SDB2_OK && v64 == 0x0102030405060708ULL);
+    CHECK(buf_remaining(&b) == 0);
+
+    buf_free(&b);
+}
+
+/* ---- buf byte slice round-trip + growth ---- */
+static void test_bytes(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 4) == SDB2_OK);  /* small cap to force growth */
+
+    uint8_t in[] = { 0x01, 0x02, 0x03, 0x04, 0x05 };
+    CHECK(buf_put_bytes(&b, in, sizeof(in)) == SDB2_OK);
+    CHECK(b.cap >= 5);  /* must have grown */
+
+    buf_flip(&b);
+    uint8_t out[5];
+    CHECK(buf_get_bytes(&b, out, 5) == SDB2_OK);
+    CHECK(memcmp(in, out, 5) == 0);
+    CHECK(buf_remaining(&b) == 0);
+
+    buf_free(&b);
+}
+
+/* ---- DDM length-backfill trick ---- */
+static void test_mark_fill(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 32) == SDB2_OK);
+
+    /* mark_len2: reserve 2-byte length slot */
+    CHECK(buf_mark_len2(&b) == SDB2_OK);
+    /* write 2-byte codepoint EXCSAT (0x1041) + 4-byte payload */
+    CHECK(buf_put_u16(&b, 0x1041)       == SDB2_OK);
+    CHECK(buf_put_u32(&b, 0xCAFEBABEUL) == SDB2_OK);
+    /* fill: length = 2 (slot itself) + 2 (cp) + 4 (data) = 8 */
+    CHECK(buf_fill_len2(&b) == SDB2_OK);
+
+    /* verify raw bytes: [00 08] [10 41] [CA FE BA BE] */
+    CHECK(b.pos            == 8);
+    CHECK(b.data[0]        == 0x00 && b.data[1] == 0x08);
+    CHECK(b.data[2]        == 0x10 && b.data[3] == 0x41);
+    CHECK(b.data[4]        == 0xCA && b.data[5] == 0xFE);
+    CHECK(b.data[6]        == 0xBA && b.data[7] == 0xBE);
+
+    buf_free(&b);
+}
+
+/* ---- nested mark/fill (simulates collection inside collection) ---- */
+static void test_nested_marks(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 32) == SDB2_OK);
+
+    CHECK(buf_mark_len2(&b) == SDB2_OK);   /* outer: offset 0 */
+        CHECK(buf_mark_len2(&b) == SDB2_OK); /* inner: offset 2 */
+            CHECK(buf_put_u8(&b, 0xFF) == SDB2_OK);
+        CHECK(buf_fill_len2(&b) == SDB2_OK); /* inner len = 3 */
+    CHECK(buf_fill_len2(&b) == SDB2_OK);   /* outer len = 5 */
+
+    /* outer: [00 05]  inner: [00 03] [FF] */
+    CHECK(b.pos    == 5);
+    CHECK(b.data[0] == 0x00 && b.data[1] == 0x05);
+    CHECK(b.data[2] == 0x00 && b.data[3] == 0x03);
+    CHECK(b.data[4] == 0xFF);
+
+    buf_free(&b);
+}
+
+/* ---- buf_reset: reuse buffer ---- */
+static void test_reset(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 8) == SDB2_OK);
+    CHECK(buf_put_u32(&b, 0x12345678UL) == SDB2_OK);
+    buf_reset(&b);
+    CHECK(b.pos == 0);
+    /* write again after reset */
+    CHECK(buf_put_u8(&b, 0xAA) == SDB2_OK);
+    buf_flip(&b);
+    uint8_t v;
+    CHECK(buf_get_u8(&b, &v) == SDB2_OK && v == 0xAA);
+    buf_free(&b);
+}
+
+/* ---- read underflow returns SDB2_NEED_MORE ---- */
+static void test_underflow(void) {
+    buf_t b;
+    CHECK(buf_init(&b, 8) == SDB2_OK);
+    CHECK(buf_put_u8(&b, 0xFF) == SDB2_OK);
+    buf_flip(&b);
+
+    uint8_t  v8;
+    uint16_t v16;
+    CHECK(buf_get_u8(&b, &v8) == SDB2_OK && v8 == 0xFF);
+    /* empty — all reads should return NEED_MORE */
+    CHECK(buf_get_u8 (&b, &v8)  == SDB2_NEED_MORE);
+    CHECK(buf_get_u16(&b, &v16) == SDB2_NEED_MORE);
+
+    buf_free(&b);
+}
+
+/* ---- net error path: unresolvable host → SDB2_ERR_NET (no crash) ---- */
+static void test_net_error(void) {
+    int fd = net_connect("invalid-host-does-not-exist.sdb2.test", 50000);
+    CHECK(fd == SDB2_ERR_NET);
+}
+
+int main(void) {
+    test_scalars();
+    test_bytes();
+    test_mark_fill();
+    test_nested_marks();
+    test_reset();
+    test_underflow();
+    test_net_error();
+
+    print_results("p1_buf");
+    return 0;
+}

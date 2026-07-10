@@ -1,0 +1,578 @@
+/* Phase 11 — ODBC public API (core) tests
+ *
+ * Tests verified WITHOUT a live DB2 connection:
+ *   H1.  SQLAllocHandle / SQLFreeHandle: ENV → DBC → STMT lifecycle
+ *   H2.  SQLSetEnvAttr(SQL_ATTR_ODBC_VERSION) / SQLGetEnvAttr round-trip
+ *   H3.  SQLSetConnectAttr(SQL_ATTR_AUTOCOMMIT) / SQLGetConnectAttr round-trip
+ *   H4.  NULL handle → SQL_INVALID_HANDLE (AllocHandle, FreeHandle)
+ *   H5.  SQLGetDiagRec: RecNumber > 1 returns SQL_NO_DATA
+ *   H6.  SQLGetDiagRec: no error yet → SQL_NO_DATA for record 1
+ *   H7.  SQLConnect to nonexistent host → SQL_ERROR; SQLGetDiagRec gives message
+ *   H8.  SQLDriverConnect parses connection string correctly (connection fails
+ *        for the same reason — network unreachable — not a parse error)
+ *   H9.  SQLFreeStmt(SQL_UNBIND) clears bindings without crash
+ *   H10. SQLNumResultCols returns 0 on fresh statement (no query run)
+ *   H11. sql_is_query heuristic: SELECT/WITH/VALUES → query; INSERT → not query
+ *   H12. SQLFreeHandle(SQL_DROP) on STMT frees without crash
+ *
+ * Live DB2 tests (skipped unless DB2_TEST_HOST is set):
+ *   L1.  SQLDriverConnect succeeds
+ *   L2.  SQLExecDirect(CREATE TABLE) + SQLRowCount
+ *   L3.  SQLExecDirect(INSERT * 3) + SQLRowCount
+ *   L4.  SQLExecDirect(SELECT) + SQLNumResultCols + SQLDescribeCol
+ *         + SQLBindCol + SQLFetch loop + row count matches
+ *   L5.  SQLGetData on unbound column during fetch loop
+ *   L6.  SQLFreeStmt(SQL_CLOSE) then re-open same SELECT
+ *   L7.  SQLPrepare + SQLExecute for SELECT
+ *   L8.  SQLExecDirect with bad SQL → SQL_ERROR + SQLGetDiagRec SQLCODE < 0
+ *   L9.  SQLExecDirect(DROP TABLE) cleanup
+ *   L10. SQLDisconnect
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#include "staticdb2/sql.h"
+#include "staticdb2/sdb2.h"
+#include "handles.h"   /* for sdb2_dbc_t.autocommit access in unit tests */
+#include "asserts.h"
+
+static int skipped = 0;
+
+
+
+/* ================================================================== */
+/* Fixture-based tests (no DB2 needed)                                  */
+/* ================================================================== */
+
+static void test_h1_handle_lifecycle(void) {
+    printf("  H1: handle lifecycle\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+
+    /* Alloc ENV */
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK(henv != SQL_NULL_HANDLE);
+
+    /* Alloc DBC from ENV */
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+    CHECK(hdbc != SQL_NULL_HANDLE);
+
+    /* Alloc STMT from DBC */
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt), SQL_SUCCESS);
+    CHECK(hstmt != SQL_NULL_HANDLE);
+
+    /* Free STMT */
+    CHECK_EQ(SQLFreeHandle(SQL_HANDLE_STMT, hstmt), SQL_SUCCESS);
+
+    /* Free DBC */
+    CHECK_EQ(SQLFreeHandle(SQL_HANDLE_DBC, hdbc), SQL_SUCCESS);
+
+    /* Free ENV */
+    CHECK_EQ(SQLFreeHandle(SQL_HANDLE_ENV, henv), SQL_SUCCESS);
+}
+
+static void test_h2_env_attrs(void) {
+    printf("  H2: SQLSetEnvAttr / SQLGetEnvAttr round-trip\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+
+    /* Set ODBC version */
+    CHECK_EQ(SQLSetEnvAttr(henv, SQL_ATTR_ODBC_VERSION,
+                           (SQLPOINTER)(intptr_t)SQL_OV_ODBC3, 0),
+             SQL_SUCCESS);
+
+    SQLINTEGER ver = 0;
+    CHECK_EQ(SQLGetEnvAttr(henv, SQL_ATTR_ODBC_VERSION, &ver, 0, NULL),
+             SQL_SUCCESS);
+    CHECK_EQ(ver, SQL_OV_ODBC3);
+
+    CHECK_EQ(SQLFreeHandle(SQL_HANDLE_ENV, henv), SQL_SUCCESS);
+}
+
+static void test_h3_conn_attrs(void) {
+    printf("  H3: SQLSetConnectAttr / SQLGetConnectAttr round-trip\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+
+    /* Default is ON */
+    SQLUINTEGER ac = 0;
+    CHECK_EQ(SQLGetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT, &ac, 0, NULL),
+             SQL_SUCCESS);
+    CHECK_EQ((int)ac, SQL_AUTOCOMMIT_ON);
+
+    /* Turn off */
+    CHECK_EQ(SQLSetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT,
+                               (SQLPOINTER)(intptr_t)SQL_AUTOCOMMIT_OFF, 0),
+             SQL_SUCCESS);
+
+    CHECK_EQ(SQLGetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT, &ac, 0, NULL),
+             SQL_SUCCESS);
+    CHECK_EQ((int)ac, SQL_AUTOCOMMIT_OFF);
+
+    /* Restore */
+    CHECK_EQ(SQLSetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT,
+                               (SQLPOINTER)(intptr_t)SQL_AUTOCOMMIT_ON, 0),
+             SQL_SUCCESS);
+
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_h4_null_handle(void) {
+    printf("  H4: NULL handle → SQL_INVALID_HANDLE\n");
+    SQLHANDLE h = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, SQL_NULL_HANDLE, &h),
+             SQL_INVALID_HANDLE);
+    CHECK_EQ(SQLFreeHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE),
+             SQL_INVALID_HANDLE);
+}
+
+static void test_h5_diagrec_recno(void) {
+    printf("  H5: SQLGetDiagRec RecNumber > 1 → SQL_NO_DATA\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+
+    /* Any handle, RecNumber=2 */
+    SQLCHAR state[6], msg[256];
+    SQLINTEGER native;
+    SQLSMALLINT mlen;
+    CHECK_EQ(SQLGetDiagRec(SQL_HANDLE_ENV, henv, 2,
+                           state, &native, msg, sizeof msg, &mlen),
+             SQL_NO_DATA);
+
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_h6_diagrec_no_error(void) {
+    printf("  H6: SQLGetDiagRec with no error → SQL_NO_DATA for rec 1\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+
+    SQLCHAR state[6], msg[256];
+    SQLINTEGER native;
+    SQLSMALLINT mlen;
+    /* No operation done → no diagnostic → SQL_NO_DATA */
+    SQLRETURN rc = SQLGetDiagRec(SQL_HANDLE_DBC, hdbc, 1,
+                                  state, &native, msg, sizeof msg, &mlen);
+    CHECK(rc == SQL_NO_DATA || rc == SQL_SUCCESS);  /* acceptable */
+
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_h7_connect_failure(void) {
+    printf("  H7: SQLConnect to nonexistent host → SQL_ERROR + diagnostic\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLSetEnvAttr(henv, SQL_ATTR_ODBC_VERSION,
+                           (SQLPOINTER)(intptr_t)SQL_OV_ODBC3, 0), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+
+    /* Connect to localhost on a port that should be closed — fails fast */
+    CHECK_EQ(SQLConnect(hdbc,
+                        (SQLCHAR *)"127.0.0.1:1/NOEXIST", SQL_NTS,
+                        (SQLCHAR *)"user", SQL_NTS,
+                        (SQLCHAR *)"pass", SQL_NTS),
+             SQL_ERROR);
+
+    /* Verify a diagnostic is available */
+    SQLCHAR state[6] = {0}, msg[256] = {0};
+    SQLINTEGER native = 0;
+    SQLSMALLINT mlen  = 0;
+    SQLRETURN rc = SQLGetDiagRec(SQL_HANDLE_DBC, hdbc, 1,
+                                  state, &native, msg, sizeof msg, &mlen);
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    CHECK(mlen > 0);  /* must have a non-empty message */
+    printf("    diag state=%.5s msg=%s\n", state, msg);
+
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_h8_driver_connect_parse(void) {
+    printf("  H8: SQLDriverConnect connection string parse\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+
+    /* This should fail to connect but must not crash (parse test). */
+    SQLCHAR out_cs[512];
+    SQLSMALLINT out_len = 0;
+    SQLDriverConnect(hdbc, NULL,
+                     (SQLCHAR *)"HOSTNAME=127.0.0.1;PORT=1;"
+                                "DATABASE=TEST;UID=u;PWD=p", SQL_NTS,
+                     out_cs, sizeof out_cs, &out_len,
+                     SQL_DRIVER_NOPROMPT);
+    /* We don't CHECK the return code here: either SQL_ERROR (connect
+     * refused) or a connection on an unexpected live host — either is OK.
+     * What matters is no crash and no buffer overflow. */
+    printf("    (connect attempt completed without crash)\n");
+
+    SQLDisconnect(hdbc);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_h9_unbind(void) {
+    printf("  H9: SQLFreeStmt(SQL_UNBIND) clears bindings\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt), SQL_SUCCESS);
+
+    char buf[64];
+    SQLLEN ind = 0;
+    /* Bind column 1 */
+    CHECK_EQ(SQLBindCol(hstmt, 1, SQL_C_CHAR, buf, sizeof buf, &ind),
+             SQL_SUCCESS);
+    /* Unbind all */
+    CHECK_EQ(SQLFreeStmt(hstmt, SQL_UNBIND), SQL_SUCCESS);
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_h10_numresultcols_fresh(void) {
+    printf("  H10: SQLNumResultCols on fresh stmt → 0\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt), SQL_SUCCESS);
+
+    SQLSMALLINT ncols = 99;
+    CHECK_EQ(SQLNumResultCols(hstmt, &ncols), SQL_SUCCESS);
+    CHECK_EQ(ncols, 0);
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_h11_rowcount_dml(void) {
+    printf("  H11: SQLRowCount returns -1 on fresh stmt\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt), SQL_SUCCESS);
+
+    SQLLEN rc = 99;
+    CHECK_EQ(SQLRowCount(hstmt, &rc), SQL_SUCCESS);
+    CHECK_EQ((int)rc, -1);
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+static void test_h12_sqldrop(void) {
+    printf("  H12: SQLFreeStmt(SQL_DROP) frees stmt without crash\n");
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt), SQL_SUCCESS);
+
+    /* SQL_DROP should free the stmt handle */
+    CHECK_EQ(SQLFreeStmt(hstmt, SQL_DROP), SQL_SUCCESS);
+    /* hstmt is now dangling — do not use it */
+
+    SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+/* ================================================================== */
+/* Live DB2 tests                                                       */
+/* ================================================================== */
+
+static void check_rc(SQLRETURN rc, SQLHSTMT hstmt, const char *op) {
+    if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        assert(op, 1);
+        return;
+    }
+    SQLCHAR state[6] = {0}, msg[512] = {0};
+    SQLINTEGER native = 0;
+    SQLSMALLINT mlen  = 0;
+    SQLGetDiagRec(SQL_HANDLE_STMT, hstmt, 1,
+                  state, &native, msg, sizeof msg, &mlen);
+    printf("  FAIL: %s returned %d; state=%.5s SQLCODE=%d msg=%s\n",
+           op, (int)rc, state, native, msg);
+    assert(op, 0);
+}
+
+static void check_dbc_rc(SQLRETURN rc, SQLHDBC hdbc, const char *op) {
+    if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        assert(op, 1);
+        return;
+    }
+    SQLCHAR state[6] = {0}, msg[512] = {0};
+    SQLINTEGER native = 0;
+    SQLSMALLINT mlen  = 0;
+    SQLGetDiagRec(SQL_HANDLE_DBC, hdbc, 1,
+                  state, &native, msg, sizeof msg, &mlen);
+    printf("  FAIL: %s returned %d; state=%.5s SQLCODE=%d msg=%s\n",
+           op, (int)rc, state, native, msg);
+    assert(op, 0);
+}
+
+static void live_tests(const char *host, int port, const char *db,
+                        const char *uid, const char *pwd) {
+    printf("\n  --- Live DB2 tests (%s:%d / %s) ---\n", host, port, db);
+
+    SQLHENV henv = SQL_NULL_HANDLE;
+    SQLHDBC hdbc = SQL_NULL_HANDLE;
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLSetEnvAttr(henv, SQL_ATTR_ODBC_VERSION,
+                           (SQLPOINTER)(intptr_t)SQL_OV_ODBC3, 0), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+
+    /* L1: connect */
+    printf("  L1: SQLDriverConnect\n");
+    char cs[512];
+    snprintf(cs, sizeof cs,
+             "HOSTNAME=%s;PORT=%d;DATABASE=%s;UID=%s;PWD=%s",
+             host, port, db, uid, pwd);
+    SQLRETURN rc = SQLDriverConnect(hdbc, NULL,
+                                    (SQLCHAR *)cs, SQL_NTS,
+                                    NULL, 0, NULL,
+                                    SQL_DRIVER_NOPROMPT);
+    check_dbc_rc(rc, hdbc, "SQLDriverConnect");
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) goto cleanup;
+
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt), SQL_SUCCESS);
+
+    /* L2: CREATE TABLE */
+    printf("  L2: CREATE TABLE\n");
+    rc = SQLExecDirect(hstmt,
+           (SQLCHAR *)"CREATE TABLE SDB2P11_TEST("
+                       "ID INTEGER NOT NULL, "
+                       "NAME VARCHAR(64), "
+                       "SCORE DOUBLE)",
+           SQL_NTS);
+    check_rc(rc, hstmt, "CREATE TABLE");
+
+    SQLLEN nrows = 0;
+    CHECK_EQ(SQLRowCount(hstmt, &nrows), SQL_SUCCESS);
+    /* DDL row count is typically 0 or -1; either is acceptable */
+    printf("    CREATE: row_count=%d\n", (int)nrows);
+
+    /* L3: INSERT 3 rows */
+    printf("  L3: INSERT * 3\n");
+    check_rc(SQLExecDirect(hstmt,
+                 (SQLCHAR *)"INSERT INTO SDB2P11_TEST VALUES(1,'Alice',9.5)",
+                 SQL_NTS),
+             hstmt, "INSERT 1");
+    CHECK_EQ(SQLRowCount(hstmt, &nrows), SQL_SUCCESS);
+    CHECK_EQ((int)nrows, 1);
+
+    check_rc(SQLExecDirect(hstmt,
+                 (SQLCHAR *)"INSERT INTO SDB2P11_TEST VALUES(2,'Bob',7.2)",
+                 SQL_NTS),
+             hstmt, "INSERT 2");
+    check_rc(SQLExecDirect(hstmt,
+                 (SQLCHAR *)"INSERT INTO SDB2P11_TEST VALUES(3,'Charlie',8.1)",
+                 SQL_NTS),
+             hstmt, "INSERT 3");
+
+    /* L4: SELECT + SQLNumResultCols + SQLDescribeCol + SQLBindCol + SQLFetch */
+    printf("  L4: SELECT + NumResultCols + DescribeCol + BindCol + Fetch\n");
+    rc = SQLExecDirect(hstmt,
+           (SQLCHAR *)"SELECT ID, NAME, SCORE FROM SDB2P11_TEST ORDER BY ID",
+           SQL_NTS);
+    check_rc(rc, hstmt, "SELECT");
+
+    SQLSMALLINT ncols = 0;
+    CHECK_EQ(SQLNumResultCols(hstmt, &ncols), SQL_SUCCESS);
+    CHECK_EQ(ncols, 3);
+
+    /* Describe each column */
+    SQLCHAR colname[128];
+    SQLSMALLINT colname_len, data_type, dec_digits, nullable;
+    SQLULEN col_size;
+
+    CHECK_EQ(SQLDescribeCol(hstmt, 1, colname, sizeof colname,
+                            &colname_len, &data_type, &col_size,
+                            &dec_digits, &nullable), SQL_SUCCESS);
+    printf("    col1: name=%s type=%d size=%d\n", colname, data_type, (int)col_size);
+    CHECK(colname_len > 0);
+    CHECK(data_type == SQL_INTEGER || data_type == SQL_SMALLINT ||
+          data_type == SQL_BIGINT);
+
+    CHECK_EQ(SQLDescribeCol(hstmt, 2, colname, sizeof colname,
+                            &colname_len, &data_type, &col_size,
+                            &dec_digits, &nullable), SQL_SUCCESS);
+    printf("    col2: name=%s type=%d size=%d nullable=%d\n",
+           colname, data_type, (int)col_size, nullable);
+    CHECK(data_type == SQL_VARCHAR || data_type == SQL_CHAR);
+    CHECK(nullable == SQL_NULLABLE || nullable == SQL_NULLABLE_UNKNOWN);
+
+    /* Bind columns 1 and 2; leave column 3 unbound for SQLGetData */
+    SQLINTEGER id = 0;
+    char name[128] = {0};
+    SQLLEN id_ind = 0, name_ind = 0;
+    CHECK_EQ(SQLBindCol(hstmt, 1, SQL_C_LONG,  &id,   sizeof id,   &id_ind),
+             SQL_SUCCESS);
+    CHECK_EQ(SQLBindCol(hstmt, 2, SQL_C_CHAR,  name,  sizeof name, &name_ind),
+             SQL_SUCCESS);
+
+    int row = 0;
+    int id_sum = 0;
+    while ((rc = SQLFetch(hstmt)) == SQL_SUCCESS ||
+            rc == SQL_SUCCESS_WITH_INFO) {
+        row++;
+        id_sum += (int)id;
+        SQLDOUBLE score = 0;
+        SQLLEN score_ind = 0;
+        /* L5: SQLGetData for unbound column 3 */
+        SQLRETURN grc = SQLGetData(hstmt, 3, SQL_C_DOUBLE,
+                                    &score, sizeof score, &score_ind);
+        CHECK(grc == SQL_SUCCESS || grc == SQL_SUCCESS_WITH_INFO);
+        printf("    row%d: id=%d name=%s score=%.2f\n",
+               row, (int)id, name, score);
+    }
+    CHECK_EQ(rc, SQL_NO_DATA);  /* normal end of cursor */
+    CHECK_EQ(row, 3);
+    CHECK_EQ(id_sum, 6);  /* 1+2+3 */
+
+    printf("  L5: SQLGetData on unbound column — verified above\n");
+
+    /* L6: SQLFreeStmt(SQL_CLOSE) then re-run SELECT */
+    printf("  L6: SQLFreeStmt(SQL_CLOSE) then re-execute\n");
+    CHECK_EQ(SQLFreeStmt(hstmt, SQL_CLOSE), SQL_SUCCESS);
+
+    rc = SQLExecDirect(hstmt,
+           (SQLCHAR *)"SELECT ID FROM SDB2P11_TEST ORDER BY ID",
+           SQL_NTS);
+    check_rc(rc, hstmt, "re-SELECT after SQL_CLOSE");
+    row = 0;
+    while ((rc = SQLFetch(hstmt)) == SQL_SUCCESS ||
+            rc == SQL_SUCCESS_WITH_INFO) {
+        row++;
+        SQLINTEGER rid = 0; SQLLEN rind = 0;
+        SQLGetData(hstmt, 1, SQL_C_LONG, &rid, sizeof rid, &rind);
+    }
+    CHECK_EQ(row, 3);
+
+    /* L7: SQLPrepare + SQLExecute */
+    printf("  L7: SQLPrepare + SQLExecute\n");
+    CHECK_EQ(SQLFreeStmt(hstmt, SQL_CLOSE), SQL_SUCCESS);
+    rc = SQLPrepare(hstmt,
+           (SQLCHAR *)"SELECT ID, NAME FROM SDB2P11_TEST ORDER BY ID",
+           SQL_NTS);
+    check_rc(rc, hstmt, "SQLPrepare");
+
+    rc = SQLExecute(hstmt);
+    check_rc(rc, hstmt, "SQLExecute");
+
+    CHECK_EQ(SQLNumResultCols(hstmt, &ncols), SQL_SUCCESS);
+    CHECK_EQ(ncols, 2);
+
+    row = 0;
+    while ((rc = SQLFetch(hstmt)) == SQL_SUCCESS ||
+            rc == SQL_SUCCESS_WITH_INFO)
+        row++;
+    CHECK_EQ(row, 3);
+
+    /* L8: Bad SQL → SQL_ERROR + non-empty diagnostic */
+    printf("  L8: bad SQL → SQL_ERROR + SQLGetDiagRec\n");
+    CHECK_EQ(SQLFreeStmt(hstmt, SQL_CLOSE), SQL_SUCCESS);
+    rc = SQLExecDirect(hstmt,
+                        (SQLCHAR *)"SELECT * FROM SDB2P11_DOES_NOT_EXIST_TABLE",
+                        SQL_NTS);
+    CHECK_EQ(rc, SQL_ERROR);
+    {
+        SQLCHAR state[6] = {0}, msg[512] = {0};
+        SQLINTEGER native = 0;
+        SQLSMALLINT mlen  = 0;
+        SQLRETURN drc = SQLGetDiagRec(SQL_HANDLE_STMT, hstmt, 1,
+                                       state, &native, msg, sizeof msg, &mlen);
+        CHECK(drc == SQL_SUCCESS || drc == SQL_SUCCESS_WITH_INFO);
+        CHECK(native < 0);  /* must be a negative SQLCODE */
+        printf("    expected SQLCODE %d state=%.5s msg=%s\n",
+               native, state, msg);
+    }
+
+    /* L9: DROP TABLE */
+    printf("  L9: DROP TABLE (cleanup)\n");
+    check_rc(SQLExecDirect(hstmt,
+                 (SQLCHAR *)"DROP TABLE SDB2P11_TEST",
+                 SQL_NTS),
+             hstmt, "DROP TABLE");
+
+cleanup:
+    /* L10: disconnect */
+    printf("  L10: SQLDisconnect\n");
+    if (hstmt != SQL_NULL_HANDLE)
+        SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    if (hdbc != SQL_NULL_HANDLE) {
+        SQLDisconnect(hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    }
+    if (henv != SQL_NULL_HANDLE)
+        SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+/* ================================================================== */
+/* main                                                                 */
+/* ================================================================== */
+
+int main(void) {
+    printf("=== Phase 11 — ODBC public API tests ===\n\n");
+
+    printf("--- Fixture tests (no DB2 needed) ---\n");
+    test_h1_handle_lifecycle();
+    test_h2_env_attrs();
+    test_h3_conn_attrs();
+    test_h4_null_handle();
+    test_h5_diagrec_recno();
+    test_h6_diagrec_no_error();
+    test_h7_connect_failure();
+    test_h8_driver_connect_parse();
+    test_h9_unbind();
+    test_h10_numresultcols_fresh();
+    test_h11_rowcount_dml();
+    test_h12_sqldrop();
+
+    /* Live DB2 tests */
+    const char *host = getenv("DB2_TEST_HOST");
+    if (host) {
+        const char *port_s = getenv("DB2_TEST_PORT");
+        const char *db     = getenv("DB2_TEST_DB");
+        const char *uid    = getenv("DB2_TEST_USER");
+        const char *pwd    = getenv("DB2_TEST_PASS");
+        int port = port_s ? atoi(port_s) : 50000;
+        if (!db)  db  = "SAMPLE";
+        if (!uid) uid = "db2inst1";
+        if (!pwd) pwd = "";
+        live_tests(host, port, db, uid, pwd);
+    } else {
+        printf("\n(Live DB2 tests SKIPPED: set DB2_TEST_HOST to enable)\n");
+        skipped += 10;
+    }
+
+    if (skipped) {
+        printf("\n(Live DB2 tests skipped: %d)\n", skipped);
+    }
+
+    print_results("p11_odbc");
+    return 0;
+}

@@ -1,0 +1,10 @@
+terminator=;
+continue-on-error=false
+author=Alice
+logging=debug
+
+[changeset:create_users_table]
+CREATE TABLE users (id INTEGER, name VARCHAR(64));
+
+[validation:users_table_exists]
+SELECT COUNT(*) FROM syscat.tables WHERE tabname='USERS'

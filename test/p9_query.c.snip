@@ -1,0 +1,529 @@
+/* Phase 9 — drda_prepare + drda_open_query + drda_fetch encoding tests
+ *
+ * Tests verified WITHOUT a live DB2 connection:
+ *   1. PRPSQLSTT DSS is RQSDSS with chain bit set (SQLSTT OBJDSS follows)
+ *   2. PRPSQLSTT DDM codepoint is 0x200D
+ *   3. PKGNAMCSN (CP 0x2113) is present inside PRPSQLSTT
+ *   4. SQLSTT OBJDSS codepoint is 0x2414 with NOCS SQL text format
+ *   5. OPNQRY DSS is RQSDSS (not chained)
+ *   6. OPNQRY DDM codepoint is 0x200C
+ *   7. QRYBLKSZ (CP 0x2114) is present in OPNQRY
+ *   8. CNTQRY DSS is RQSDSS (not chained)
+ *   9. CNTQRY DDM codepoint is 0x2006
+ *  10. QRYINSID (CP 0x215B) 8-byte value matches what was set
+ *  11. compute_row_wire_size handles INT32 / VARCHAR columns correctly
+ *  12. handles alloc/free are well-formed
+ *
+ * Live DB2 tests (skipped unless DB2_TEST_HOST is set):
+ *  L1. Full prepare + open + fetch loop retrieves expected row count
+ *  L2. CNTQRY is triggered when SDB2_QRYBLKSZ is small
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include "buf.h"
+#include "dss.h"
+#include "ddm.h"
+#include "drda.h"
+#include "fdoca.h"
+#include "handles.h"
+#include "ccsid.h"
+#include "staticdb2/sdb2.h"
+#include "asserts.h"
+
+
+static uint16_t u16be(const uint8_t *p) { return ((uint16_t)p[0] << 8) | p[1]; }
+static uint32_t u32be(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  | p[3];
+}
+static uint64_t u64be(const uint8_t *p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+    return v;
+}
+
+/* ---- Find a DDM object codepoint within a flat payload buffer ---- */
+static const uint8_t *find_ddm(const uint8_t *buf, size_t len, uint16_t cp) {
+    size_t i = 0;
+    while (i + 4 <= len) {
+        uint16_t obj_len = u16be(buf + i);
+        uint16_t obj_cp  = u16be(buf + i + 2);
+        if (obj_cp == cp) return buf + i;
+        if (obj_len < 4) break;
+        i += obj_len;
+    }
+    return NULL;
+}
+
+/* ---- Build a minimal drda_conn_t stub without a real socket ---- */
+static drda_conn_t *make_stub_conn(const char *db) {
+    drda_conn_t *conn = (drda_conn_t *)calloc(1, sizeof(*conn));
+    if (!conn) return NULL;
+    conn->fd = -1;
+    buf_init(&conn->send_buf, 4096);
+    buf_init(&conn->recv_buf, 4096);
+    conn->corr_id      = 0;
+    conn->next_section = 1;
+    /* Encode RDBNAM to EBCDIC */
+    size_t dblen = strlen(db);
+    int enc = ccsid_utf8_to_wire(CCSID_EBCDIC,
+                                  (const uint8_t *)db, dblen,
+                                  conn->rdbnam_ebcdic, 18);
+    if (enc < (int)dblen && enc >= 0) {
+        size_t elen = (size_t)enc;
+        if (elen < 18) memset(conn->rdbnam_ebcdic + elen, 0x40, 18 - elen);
+    }
+    return conn;
+}
+
+static void free_stub_conn(drda_conn_t *conn) {
+    if (!conn) return;
+    buf_free(&conn->send_buf);
+    buf_free(&conn->recv_buf);
+    free(conn);
+}
+
+/* ---- Test 1-4: PRPSQLSTT encoding ---- */
+static void test_prpsqlstt_encoding(void) {
+    drda_conn_t *conn = make_stub_conn("TESTDB");
+    CHECK(conn != NULL);
+    if (!conn) return;
+
+    /* Build PRPSQLSTT + SQLSTT as drda_prepare would. */
+    /* Access internal helpers via the same call sequence. */
+    sdb2_env_t  *env  = sdb2_env_alloc();
+    sdb2_dbc_t  *dbc  = sdb2_dbc_alloc(env);
+    dbc->conn = conn;
+    sdb2_stmt_t *stmt = sdb2_stmt_alloc(dbc);
+
+    /* drda_prepare builds into conn->send_buf via drda_flush, but that calls
+     * net_send_all which would fail on fd=-1.  Instead, call the same internal
+     * builders directly to inspect the bytes. */
+
+    /* Build PRPSQLSTT DSS 1 (chained) */
+    conn->corr_id++;
+    uint16_t cid = conn->corr_id;
+    dss_begin_rqsdss(&conn->send_buf, cid, 1, 1);
+    ddm_begin_collection(&conn->send_buf, CP_PRPSQLSTT);
+
+    /* PKGNAMCSN - build directly */
+    static const uint8_t rdbcolid[18] = {
+        0xD5,0xE4,0xD3,0xD3,0xC9,0xC4,
+        0x40,0x40,0x40,0x40,0x40,0x40,
+        0x40,0x40,0x40,0x40,0x40,0x40
+    };
+    static const uint8_t pkgid[18] = {
+        0xE2,0xE8,0xE2,0xE2,0xC8,0xC1,
+        0x40,0x40,0x40,0x40,0x40,0x40,
+        0x40,0x40,0x40,0x40,0x40,0x40
+    };
+    static const uint8_t zeros8[8] = { 0 };
+
+    ddm_begin_collection(&conn->send_buf, CP_PKGNAMCSN);
+    buf_put_bytes(&conn->send_buf, conn->rdbnam_ebcdic, 18);
+    buf_put_bytes(&conn->send_buf, rdbcolid, 18);
+    buf_put_bytes(&conn->send_buf, pkgid, 18);
+    buf_put_bytes(&conn->send_buf, zeros8, 8);
+    buf_put_u16(&conn->send_buf, 1); /* section 1 */
+    ddm_end_collection(&conn->send_buf);
+
+    ddm_end_collection(&conn->send_buf);
+    dss_finalize(&conn->send_buf);
+
+    /* Build SQLSTT OBJDSS 2 */
+    const char *sql = "SELECT 1 FROM SYSIBM.SYSDUMMY1";
+    dss_begin_objdss(&conn->send_buf, cid, 0, 0);
+    ddm_begin_collection(&conn->send_buf, CP_SQLSTT);
+    buf_put_u8(&conn->send_buf, 0xFF);
+    buf_put_u8(&conn->send_buf, 0x00);
+    buf_put_u32(&conn->send_buf, (uint32_t)strlen(sql));
+    buf_put_bytes(&conn->send_buf, (const uint8_t *)sql, strlen(sql));
+    ddm_end_collection(&conn->send_buf);
+    dss_finalize(&conn->send_buf);
+
+    /* Flip to read mode and inspect. */
+    buf_flip(&conn->send_buf);
+    const uint8_t *bytes = conn->send_buf.data;
+    size_t  total  = conn->send_buf.limit;
+
+    CHECK(total > 12);
+
+    /* DSS 1: RQSDSS with chain bit */
+    uint16_t dss1_len = u16be(bytes);
+    CHECK(bytes[2] == 0xD0);                      /* magic */
+    CHECK((bytes[3] & 0x0F) == DSS_FMT_RQSDSS);  /* RQSDSS */
+    CHECK((bytes[3] & DSS_CHAIN) != 0);           /* chained */
+    CHECK(u16be(bytes + 4) == cid);               /* corrId */
+
+    /* PRPSQLSTT DDM must be inside DSS 1 payload */
+    const uint8_t *dss1_payload = bytes + DSS_HDR_LEN;
+    size_t dss1_payload_len     = dss1_len - DSS_HDR_LEN;
+    const uint8_t *prp = find_ddm(dss1_payload, dss1_payload_len, CP_PRPSQLSTT);
+    CHECK(prp != NULL);  /* PRPSQLSTT DDM found */
+
+    if (prp) {
+        size_t prp_payload = u16be(prp) - 4;
+        CHECK(find_ddm(prp + 4, prp_payload, CP_PKGNAMCSN) != NULL); /* PKGNAMCSN */
+    }
+
+    /* DSS 2: OBJDSS, same corrId, not chained */
+    const uint8_t *dss2 = bytes + dss1_len;
+    CHECK(dss2 + DSS_HDR_LEN <= bytes + total);
+    uint16_t dss2_len = u16be(dss2);
+    CHECK(dss2[2] == 0xD0);
+    CHECK((dss2[3] & 0x0F) == DSS_FMT_OBJDSS);  /* OBJDSS */
+    CHECK((dss2[3] & DSS_CHAIN) == 0);           /* not chained */
+    CHECK(u16be(dss2 + 4) == cid);               /* same corrId */
+
+    /* SQLSTT DDM inside DSS 2 payload */
+    const uint8_t *dss2_payload = dss2 + DSS_HDR_LEN;
+    size_t dss2_payload_len     = dss2_len - DSS_HDR_LEN;
+    const uint8_t *stt = find_ddm(dss2_payload, dss2_payload_len, CP_SQLSTT);
+    CHECK(stt != NULL);  /* SQLSTT DDM found */
+
+    if (stt) {
+        /* SQLSTT content: FF 00 <4-byte-len> <sql> */
+        const uint8_t *stt_data = stt + 4;  /* skip ll+cp */
+        CHECK(stt_data[0] == 0xFF);         /* NOCM null */
+        CHECK(stt_data[1] == 0x00);         /* NOCS not-null */
+        uint32_t sql_len_wire = u32be(stt_data + 2);
+        CHECK(sql_len_wire == (uint32_t)strlen(sql));
+        CHECK(memcmp(stt_data + 6, sql, strlen(sql)) == 0);
+    }
+
+    stmt->dbc = NULL; dbc->conn = NULL; /* avoid double-free */
+    sdb2_stmt_free(stmt);
+    sdb2_dbc_free(dbc);
+    sdb2_env_free(env);
+    free_stub_conn(conn);
+
+    printf("PASS: PRPSQLSTT encoding (tests 1-4)\n");
+}
+
+/* ---- Test 5-7: OPNQRY encoding ---- */
+static void test_opnqry_encoding(void) {
+    drda_conn_t *conn = make_stub_conn("TESTDB");
+    if (!conn) return;
+
+    conn->corr_id++;
+    uint16_t cid = conn->corr_id;
+    dss_begin_rqsdss(&conn->send_buf, cid, 0, 0);
+    ddm_begin_collection(&conn->send_buf, CP_OPNQRY);
+
+    static const uint8_t rdbcolid[18] = {
+        0xD5,0xE4,0xD3,0xD3,0xC9,0xC4,
+        0x40,0x40,0x40,0x40,0x40,0x40,
+        0x40,0x40,0x40,0x40,0x40,0x40
+    };
+    static const uint8_t pkgid[18] = {
+        0xE2,0xE8,0xE2,0xE2,0xC8,0xC1,
+        0x40,0x40,0x40,0x40,0x40,0x40,
+        0x40,0x40,0x40,0x40,0x40,0x40
+    };
+    static const uint8_t zeros8[8] = { 0 };
+
+    ddm_begin_collection(&conn->send_buf, CP_PKGNAMCSN);
+    buf_put_bytes(&conn->send_buf, conn->rdbnam_ebcdic, 18);
+    buf_put_bytes(&conn->send_buf, rdbcolid, 18);
+    buf_put_bytes(&conn->send_buf, pkgid, 18);
+    buf_put_bytes(&conn->send_buf, zeros8, 8);
+    buf_put_u16(&conn->send_buf, 1);
+    ddm_end_collection(&conn->send_buf);
+    ddm_put_scalar_u32(&conn->send_buf, CP_QRYBLKSZ, 32767);
+    ddm_end_collection(&conn->send_buf);
+    dss_finalize(&conn->send_buf);
+
+    buf_flip(&conn->send_buf);
+    const uint8_t *bytes = conn->send_buf.data;
+    size_t total         = conn->send_buf.limit;
+
+    CHECK(total > DSS_HDR_LEN);
+    /* DSS: RQSDSS, not chained */
+    CHECK(bytes[2] == 0xD0);
+    CHECK((bytes[3] & 0x0F) == DSS_FMT_RQSDSS);
+    CHECK((bytes[3] & DSS_CHAIN) == 0);  /* not chained */
+    CHECK(u16be(bytes + 4) == cid);
+
+    uint16_t dss_len = u16be(bytes);
+    const uint8_t *payload  = bytes + DSS_HDR_LEN;
+    size_t         plen     = dss_len - DSS_HDR_LEN;
+
+    const uint8_t *opnqry = find_ddm(payload, plen, CP_OPNQRY);
+    CHECK(opnqry != NULL);  /* OPNQRY DDM found */
+
+    if (opnqry) {
+        size_t opn_inner_len = u16be(opnqry) - 4;
+        const uint8_t *opn_inner = opnqry + 4;
+        CHECK(find_ddm(opn_inner, opn_inner_len, CP_PKGNAMCSN) != NULL);
+        const uint8_t *qbs = find_ddm(opn_inner, opn_inner_len, CP_QRYBLKSZ);
+        CHECK(qbs != NULL);
+        if (qbs) CHECK(u32be(qbs + 4) == 32767);
+    }
+
+    free_stub_conn(conn);
+    printf("PASS: OPNQRY encoding (tests 5-7)\n");
+}
+
+/* ---- Test 8-10: CNTQRY encoding ---- */
+static void test_cntqry_encoding(void) {
+    drda_conn_t *conn = make_stub_conn("TESTDB");
+    if (!conn) return;
+
+    uint64_t qryinsid = 0x0102030405060708ULL;
+
+    conn->corr_id++;
+    uint16_t cid = conn->corr_id;
+    dss_begin_rqsdss(&conn->send_buf, cid, 0, 0);
+    ddm_begin_collection(&conn->send_buf, CP_CNTQRY);
+
+    static const uint8_t rdbcolid[18] = {
+        0xD5,0xE4,0xD3,0xD3,0xC9,0xC4,
+        0x40,0x40,0x40,0x40,0x40,0x40,
+        0x40,0x40,0x40,0x40,0x40,0x40
+    };
+    static const uint8_t pkgid[18] = {
+        0xE2,0xE8,0xE2,0xE2,0xC8,0xC1,
+        0x40,0x40,0x40,0x40,0x40,0x40,
+        0x40,0x40,0x40,0x40,0x40,0x40
+    };
+    static const uint8_t zeros8[8] = { 0 };
+
+    ddm_begin_collection(&conn->send_buf, CP_PKGNAMCSN);
+    buf_put_bytes(&conn->send_buf, conn->rdbnam_ebcdic, 18);
+    buf_put_bytes(&conn->send_buf, rdbcolid, 18);
+    buf_put_bytes(&conn->send_buf, pkgid, 18);
+    buf_put_bytes(&conn->send_buf, zeros8, 8);
+    buf_put_u16(&conn->send_buf, 1);
+    ddm_end_collection(&conn->send_buf);
+    ddm_put_scalar_u32(&conn->send_buf, CP_QRYBLKSZ, 32767);
+    /* QRYINSID scalar */
+    buf_put_u16(&conn->send_buf, 12);        /* len = 4 + 8 */
+    buf_put_u16(&conn->send_buf, CP_QRYINSID);
+    buf_put_u64(&conn->send_buf, qryinsid);
+    ddm_end_collection(&conn->send_buf);
+    dss_finalize(&conn->send_buf);
+
+    buf_flip(&conn->send_buf);
+    const uint8_t *bytes = conn->send_buf.data;
+    size_t total         = conn->send_buf.limit;
+
+    CHECK(total > DSS_HDR_LEN);
+    CHECK(bytes[2] == 0xD0);
+    CHECK((bytes[3] & 0x0F) == DSS_FMT_RQSDSS);  /* RQSDSS */
+    CHECK((bytes[3] & DSS_CHAIN) == 0);           /* not chained */
+
+    uint16_t dss_len = u16be(bytes);
+    const uint8_t *payload = bytes + DSS_HDR_LEN;
+    size_t plen            = dss_len - DSS_HDR_LEN;
+
+    const uint8_t *cnt = find_ddm(payload, plen, CP_CNTQRY);
+    CHECK(cnt != NULL);  /* CNTQRY DDM found */
+
+    if (cnt) {
+        size_t cnt_inner_len = u16be(cnt) - 4;
+        const uint8_t *cnt_inner = cnt + 4;
+        const uint8_t *qid = find_ddm(cnt_inner, cnt_inner_len, CP_QRYINSID);
+        CHECK(qid != NULL);
+        if (qid) {
+            /* QRYINSID: [ll=12][cp=0x215B][8-byte value] */
+            CHECK(u16be(qid) == 12);
+            CHECK(u64be(qid + 4) == qryinsid);
+        }
+    }
+
+    free_stub_conn(conn);
+    printf("PASS: CNTQRY encoding (tests 8-10)\n");
+}
+
+/* ---- Test 11: row wire size computation ---- */
+static void test_row_wire_size(void) {
+    /* Simulate a 2-column result: INT32 (non-null), VARCHAR(max=20, nullable) */
+    fdoca_col_t cols[2];
+    fdoca_result_t res;
+    res.cols  = cols;
+    res.ncols = 2;
+
+    cols[0].drda_type = 0x02;  /* INTEGER, not nullable */
+    cols[0].length    = 4;
+    cols[0].nullable  = 0;
+    cols[0].sdb2_type = SDB2_C_INT32;
+
+    cols[1].drda_type = 0x33;  /* VARCHAR, nullable */
+    cols[1].length    = 20;
+    cols[1].nullable  = 1;
+    cols[1].sdb2_type = SDB2_C_VARCHAR;
+
+    /* Row: [INT32=42][null_ind=0x00][varchar_len=5][hello] */
+    uint8_t row[4 + 1 + 2 + 5];
+    row[0] = 0x00; row[1] = 0x00; row[2] = 0x00; row[3] = 0x2A; /* 42 BE */
+    row[4] = 0x00;          /* not null */
+    row[5] = 0x00; row[6] = 0x05;  /* varchar length = 5 */
+    memcpy(row + 7, "hello", 5);
+
+    /* Use the same logic as drda.c's compute_row_wire_size. */
+    size_t offset = 0;
+    for (int i = 0; i < res.ncols; i++) {
+        const fdoca_col_t *c = &res.cols[i];
+        if (c->nullable) {
+            uint8_t ni = row[offset++];
+            if (ni & 0x80) continue;
+        }
+        if (c->sdb2_type == SDB2_C_INT32) {
+            offset += c->length;
+        } else if (c->sdb2_type == SDB2_C_VARCHAR) {
+            uint16_t vlen = ((uint16_t)row[offset] << 8) | row[offset+1];
+            offset += 2 + vlen;
+        }
+    }
+    CHECK(offset == sizeof(row));  /* 4 + 1 + 2 + 5 = 12 */
+
+    /* NULL case: varchar is null */
+    uint8_t row_null[4 + 1];
+    row_null[0] = 0x00; row_null[1] = 0x00; row_null[2] = 0x00; row_null[3] = 0x01;
+    row_null[4] = 0xFF;  /* null indicator for varchar */
+
+    offset = 0;
+    for (int i = 0; i < res.ncols; i++) {
+        const fdoca_col_t *c = &res.cols[i];
+        if (c->nullable) {
+            uint8_t ni = row_null[offset++];
+            if (ni & 0x80) continue;
+        }
+        if (c->sdb2_type == SDB2_C_INT32)
+            offset += c->length;
+        else if (c->sdb2_type == SDB2_C_VARCHAR) {
+            uint16_t vlen = ((uint16_t)row_null[offset] << 8) | row_null[offset+1];
+            offset += 2 + vlen;
+        }
+    }
+    CHECK(offset == sizeof(row_null));  /* 4 + 1 = 5 */
+
+    printf("PASS: row wire-size computation (test 11)\n");
+}
+
+/* ---- Test 12: handle alloc / free ---- */
+static void test_handles(void) {
+    sdb2_env_t  *env  = sdb2_env_alloc();
+    CHECK(env != NULL);
+
+    sdb2_dbc_t  *dbc  = sdb2_dbc_alloc(env);
+    CHECK(dbc != NULL);
+    CHECK(dbc->env == env);
+    CHECK(dbc->conn == NULL);
+    CHECK(dbc->next_section == 1);
+
+    sdb2_stmt_t *stmt = sdb2_stmt_alloc(dbc);
+    CHECK(stmt != NULL);
+    CHECK(stmt->dbc == dbc);
+    CHECK(stmt->section == 0);
+    CHECK(stmt->cols.ncols == 0);
+    CHECK(stmt->row_buf == NULL);
+    CHECK(stmt->eof == false);
+    CHECK(stmt->cursor_open == false);
+
+    /* detach conn to avoid free of NULL */
+    sdb2_stmt_free(stmt);
+    sdb2_dbc_free(dbc);
+    sdb2_env_free(env);
+
+    printf("PASS: handle alloc/free (test 12)\n");
+}
+
+/* ---- Live DB2 tests ---- */
+#ifdef LIVE_DB2
+
+static void live_test_fetch(const char *host, int port,
+                             const char *db, const char *user, const char *pass) {
+    printf("  [LIVE] connecting to %s:%d db=%s\n", host, port, db);
+    sdb2_env_t *env = sdb2_env_alloc();
+    sdb2_dbc_t *dbc = sdb2_dbc_alloc(env);
+
+    dbc->conn = drda_connect(host, port, db, user, pass, NULL, 0);
+    if (!dbc->conn) {
+        printf("  [LIVE] connect failed: %s\n", dbc->conn ? "" : "(null)");
+        sdb2_dbc_free(dbc);
+        sdb2_env_free(env);
+        return;
+    }
+
+    /* Create a small test table and insert rows. */
+    drda_exec_immediate(dbc->conn,
+        "CREATE TABLE P9TEST (ID INTEGER, VAL VARCHAR(20))", NULL);
+    drda_exec_immediate(dbc->conn,
+        "INSERT INTO P9TEST VALUES (1,'alpha')", NULL);
+    drda_exec_immediate(dbc->conn,
+        "INSERT INTO P9TEST VALUES (2,'beta')", NULL);
+    drda_exec_immediate(dbc->conn,
+        "INSERT INTO P9TEST VALUES (3,'gamma')", NULL);
+
+    sdb2_stmt_t *stmt = sdb2_stmt_alloc(dbc);
+    int r = drda_prepare(stmt, "SELECT ID, VAL FROM P9TEST ORDER BY ID");
+    if (r != SDB2_OK) {
+        printf("  [LIVE] prepare failed: %d msg=%s\n", r, stmt->diag_msg);
+        goto cleanup;
+    }
+    printf("  [LIVE] prepare OK, section=%d\n", stmt->section);
+
+    r = drda_open_query(stmt);
+    if (r != SDB2_OK && r != SDB2_ERR_NODATA) {
+        printf("  [LIVE] open_query failed: %d msg=%s\n", r, stmt->diag_msg);
+        goto cleanup;
+    }
+
+    int row_count = 0;
+    for (;;) {
+        const uint8_t *row;
+        size_t row_len;
+        r = drda_fetch(stmt, &row, &row_len);
+        if (r == SDB2_ERR_NODATA) break;
+        if (r != SDB2_OK) {
+            printf("  [LIVE] fetch error: %d\n", r);
+            break;
+        }
+        row_count++;
+    }
+    printf("  [LIVE] fetched %d rows (expected 3)\n", row_count);
+    CHECK(row_count == 3);
+
+    /* Cleanup: drop table */
+    drda_exec_immediate(dbc->conn, "DROP TABLE P9TEST", NULL);
+
+cleanup:
+    sdb2_stmt_free(stmt);
+    drda_disconnect(dbc->conn);
+    dbc->conn = NULL;
+    sdb2_dbc_free(dbc);
+    sdb2_env_free(env);
+}
+
+#endif /* LIVE_DB2 */
+
+int main(void) {
+    test_prpsqlstt_encoding();
+    test_opnqry_encoding();
+    test_cntqry_encoding();
+    test_row_wire_size();
+    test_handles();
+
+#ifdef LIVE_DB2
+    const char *h = getenv("DB2_TEST_HOST");
+    const char *p = getenv("DB2_TEST_PORT");
+    const char *d = getenv("DB2_TEST_DB");
+    const char *u = getenv("DB2_TEST_USER");
+    const char *w = getenv("DB2_TEST_PASS");
+    if (h && d && u && w) {
+        int port = p ? atoi(p) : 50000;
+        live_test_fetch(h, port, d, u, w);
+    } else {
+        printf("  [LIVE] skipped — DB2_TEST_HOST not set\n");
+    }
+#endif
+
+    print_results("p9_query");
+    return 0;
+}

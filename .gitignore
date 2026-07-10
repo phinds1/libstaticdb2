@@ -1,0 +1,6 @@
+.idea
+target
+./references/
+*.o
+*.geany
+*.a

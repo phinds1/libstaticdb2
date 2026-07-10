@@ -1,0 +1,305 @@
+/* Phase 14 — Non-blocking / nginx integration tests
+ *
+ * Fixture tests (no live DB2 needed):
+ *   T1: I/O vtable dispatch — mock callbacks receive calls from drda_flush/drda_recv_n
+ *   T2: drda_flush routes bytes through io_send
+ *   T3: drda_recv_n routes through io_recv and propagates NEED_MORE
+ *   T4: net_set_nonblocking sets O_NONBLOCK flag on fd
+ *   T5: net_nb_recv returns NEED_MORE on empty non-blocking pipe
+ *   T6: net_nb_send on a full pipe returns NEED_WRITE
+ *   T7: sdb2_async_configure installs polled callbacks and sets O_NONBLOCK
+ *   T8: polled callbacks drive a round-trip over a non-blocking socketpair
+ *
+ * Live tests (DB2_TEST_HOST required):
+ *   L1: full connect→exec→disconnect using sdb2_async_configure (non-blocking path)
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <poll.h>
+
+/* Pull in the full library via source inclusion (snip pattern). */
+#include "drda.h"
+#include "async.h"
+#include "buf.h"
+#include "net.h"
+#include "staticdb2/sdb2.h"
+
+/* Also pull in the public ODBC API for live test. */
+#include "staticdb2/sql.h"
+#include "handles.h"
+#include "asserts.h"
+
+#define PASS(msg) assert((msg), 1)
+#define FAIL(msg) assert((msg), 0)
+#define ASSERT(cond, msg) assert((msg), (cond))
+
+/* ---- Mock I/O callbacks ---- */
+static int mock_send_calls = 0;
+static int mock_recv_calls = 0;
+static uint8_t mock_send_data[256];
+static size_t  mock_send_len = 0;
+
+/* Canned recv data for T1/T2/T3 */
+static const uint8_t canned_byte = 0xAB;
+
+static int mock_io_send(void *ctx, const uint8_t *data, size_t len) {
+    (void)ctx;
+    mock_send_calls++;
+    if (len <= sizeof(mock_send_data)) {
+        memcpy(mock_send_data, data, len);
+        mock_send_len = len;
+    }
+    return SDB2_OK;
+}
+
+static int mock_io_recv(void *ctx, uint8_t *buf, size_t len, size_t *nread) {
+    (void)ctx;
+    mock_recv_calls++;
+    if (len == 0) { *nread = 0; return SDB2_OK; }
+    buf[0] = canned_byte;
+    *nread = 1;
+    (void)len;
+    return SDB2_OK;
+}
+
+static int mock_io_recv_need_more(void *ctx, uint8_t *buf, size_t len, size_t *nread) {
+    (void)ctx; (void)buf; (void)len; (void)nread;
+    return SDB2_NEED_MORE;
+}
+
+/* Build a minimal drda_conn_t wired to mock callbacks (no real socket). */
+static drda_conn_t *make_mock_conn(void) {
+    drda_conn_t *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    c->fd        = -1;
+    c->io_ctx    = NULL;
+    c->io_send   = mock_io_send;
+    c->io_recv   = mock_io_recv;
+    buf_init(&c->send_buf, 64);
+    buf_init(&c->recv_buf, 64);
+    return c;
+}
+
+static void free_mock_conn(drda_conn_t *c) {
+    buf_free(&c->send_buf);
+    buf_free(&c->recv_buf);
+    free(c);
+}
+
+/* ---- T1: vtable dispatch ---- */
+static void t1_vtable_dispatch(void) {
+    drda_conn_t *c = make_mock_conn();
+    if (!c) { FAIL("T1 alloc"); return; }
+
+    /* Write a byte into send_buf then flush — should call mock_io_send */
+    mock_send_calls = 0;
+    buf_put_u8(&c->send_buf, 0x42);
+    drda_flush(c);
+    ASSERT(mock_send_calls == 1, "T1: drda_flush calls io_send once");
+    ASSERT(mock_send_len == 1 && mock_send_data[0] == 0x42,
+           "T1: correct byte sent via vtable");
+
+    /* drda_recv_n for 1 byte — should call mock_io_recv */
+    mock_recv_calls = 0;
+    buf_reset(&c->recv_buf);
+    int r = drda_recv_n(c, 1);
+    ASSERT(r == SDB2_OK, "T1: drda_recv_n returns OK");
+    ASSERT(mock_recv_calls >= 1, "T1: drda_recv_n calls io_recv");
+    ASSERT(c->recv_buf.data[0] == canned_byte, "T1: byte from io_recv stored in recv_buf");
+
+    free_mock_conn(c);
+}
+
+/* ---- T2: NEED_MORE propagation ---- */
+static void t2_need_more_propagation(void) {
+    drda_conn_t *c = make_mock_conn();
+    if (!c) { FAIL("T2 alloc"); return; }
+    c->io_recv = mock_io_recv_need_more;
+
+    buf_reset(&c->recv_buf);
+    int r = drda_recv_n(c, 4);
+    ASSERT(r == SDB2_NEED_MORE, "T2: drda_recv_n propagates NEED_MORE from io_recv");
+
+    free_mock_conn(c);
+}
+
+/* ---- T3: net_set_nonblocking ---- */
+static void t3_set_nonblocking(void) {
+    int fds[2];
+    if (pipe(fds) != 0) { FAIL("T3 pipe"); return; }
+
+    int r = net_set_nonblocking(fds[0]);
+    ASSERT(r == SDB2_OK, "T3: net_set_nonblocking returns OK");
+
+    int flags = fcntl(fds[0], F_GETFL, 0);
+    ASSERT(flags >= 0 && (flags & O_NONBLOCK), "T3: O_NONBLOCK flag set on fd");
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+/* ---- T4: net_nb_recv returns NEED_MORE on empty non-blocking socketpair ---- */
+static void t4_nb_recv_need_more(void) {
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        FAIL("T4 socketpair"); return;
+    }
+    net_set_nonblocking(fds[0]);
+
+    uint8_t buf[4];
+    size_t  nread = 0;
+    void   *ctx = (void *)(intptr_t)fds[0];
+    int r = net_nb_recv(ctx, buf, sizeof(buf), &nread);
+    ASSERT(r == SDB2_NEED_MORE, "T4: net_nb_recv → NEED_MORE on empty socket");
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+/* ---- T5: net_nb_send returns NEED_WRITE when socket buffer is full ---- */
+static void t5_nb_send_need_write(void) {
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        FAIL("T5 socketpair"); return;
+    }
+    /* Shrink both socket buffers as small as the kernel allows. */
+    int sndbuf = 1024;
+    setsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    net_set_nonblocking(fds[1]);
+
+    /* Flood writes until NEED_WRITE (or fail after a reasonable number). */
+    uint8_t chunk[4096];
+    memset(chunk, 0, sizeof(chunk));
+    void *ctx = (void *)(intptr_t)fds[1];
+    int got_need_write = 0;
+    for (int i = 0; i < 4096; i++) {
+        int r = net_nb_send(ctx, chunk, sizeof(chunk));
+        if (r == SDB2_NEED_WRITE) { got_need_write = 1; break; }
+        if (r != SDB2_OK) break;
+    }
+    ASSERT(got_need_write, "T5: net_nb_send → NEED_WRITE when socket buffer full");
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+/* ---- T6: sdb2_async_configure installs polled callbacks + O_NONBLOCK ---- */
+static void t6_async_configure(void) {
+    /* Use a real socketpair so we have a valid fd */
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        FAIL("T6 socketpair"); return;
+    }
+
+    drda_conn_t *c = calloc(1, sizeof(*c));
+    if (!c) { close(fds[0]); close(fds[1]); FAIL("T6 alloc"); return; }
+    c->fd       = fds[0];
+    c->io_ctx   = (void *)(intptr_t)fds[0];
+    c->io_send  = net_blocking_send;
+    c->io_recv  = net_blocking_recv;
+    buf_init(&c->send_buf, 64);
+    buf_init(&c->recv_buf, 64);
+
+    int r = sdb2_async_configure(c);
+    ASSERT(r == SDB2_OK, "T6: sdb2_async_configure returns OK");
+
+    int flags = fcntl(fds[0], F_GETFL, 0);
+    ASSERT(flags >= 0 && (flags & O_NONBLOCK), "T6: fd is O_NONBLOCK after configure");
+    ASSERT(c->io_send == sdb2_async_polled_send, "T6: io_send = polled_send");
+    ASSERT(c->io_recv == sdb2_async_polled_recv, "T6: io_recv = polled_recv");
+
+    buf_free(&c->send_buf);
+    buf_free(&c->recv_buf);
+    free(c);
+    close(fds[0]);
+    close(fds[1]);
+}
+
+/* ---- T7: polled callbacks drive a round-trip over a non-blocking socketpair ---- */
+static void t7_polled_round_trip(void) {
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        FAIL("T7 socketpair"); return;
+    }
+    /* Set both ends non-blocking */
+    net_set_nonblocking(fds[0]);
+    net_set_nonblocking(fds[1]);
+
+    /* Send 8 bytes from fd[0] using polled_send */
+    uint8_t out[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    void *ctx0 = (void *)(intptr_t)fds[0];
+    int r = sdb2_async_polled_send(ctx0, out, sizeof(out));
+    ASSERT(r == SDB2_OK, "T7: polled_send sends 8 bytes over non-blocking socket");
+
+    /* Receive them from fd[1] using polled_recv */
+    uint8_t in_buf[8] = {0};
+    size_t  got = 0;
+    void *ctx1 = (void *)(intptr_t)fds[1];
+    r = sdb2_async_polled_recv(ctx1, in_buf, sizeof(in_buf), &got);
+    ASSERT(r == SDB2_OK, "T7: polled_recv receives bytes from non-blocking socket");
+    ASSERT(got == 8 && memcmp(in_buf, out, 8) == 0,
+           "T7: received bytes match sent bytes");
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+int main(void) {
+    printf("=== Phase 14 — Non-blocking / nginx integration tests ===\n\n");
+    printf("--- Fixture tests (no DB2 needed) ---\n");
+
+    t1_vtable_dispatch();
+    t2_need_more_propagation();
+    t3_set_nonblocking();
+    t4_nb_recv_need_more();
+    t5_nb_send_need_write();
+    t6_async_configure();
+    t7_polled_round_trip();
+
+    /* ---- Live tests ---- */
+    const char *host = getenv("DB2_TEST_HOST");
+    if (!host) {
+        printf("\n(Live DB2 tests SKIPPED: set DB2_TEST_HOST to enable)\n");
+    } else {
+        int port = 50000;
+        const char *portenv = getenv("DB2_TEST_PORT");
+        if (portenv) port = atoi(portenv);
+        const char *db   = getenv("DB2_TEST_DB");   if (!db)   db   = "SAMPLE";
+        const char *user = getenv("DB2_TEST_USER");  if (!user) user = "db2inst1";
+        const char *pass = getenv("DB2_TEST_PASS");  if (!pass) pass = "db2inst1";
+
+        char errmsg[256];
+        drda_conn_t *conn = drda_connect(host, port, db, user, pass, errmsg, sizeof(errmsg));
+        if (!conn) {
+            printf("  SKIP L1: drda_connect failed: %s\n", errmsg);
+        } else {
+            int rc = sdb2_async_configure(conn);
+            if (rc != SDB2_OK) {
+                printf("  FAIL L1: sdb2_async_configure: %d\n", rc);
+                assert("L1: sdb2_async_configure returns OK", 0);
+            } else {
+                int32_t nrows = 0;
+                rc = drda_exec_immediate(conn,
+                    "SELECT CURRENT DATE FROM SYSIBM.SYSDUMMY1", &nrows);
+                ASSERT(rc == SDB2_OK || rc == SDB2_ERR_SQL,
+                       "L1: exec_immediate over non-blocking socket completes");
+                printf("  L1: sqlcode=%d\n", conn->diag_sqlcode);
+            }
+            drda_disconnect(conn);
+        }
+    }
+
+    if (!host) {
+        printf("\n(Live DB2 tests skipped: set DB2_TEST_HOST to enable)\n");
+    }
+
+    print_results("p14_async");
+    return 0;
+}

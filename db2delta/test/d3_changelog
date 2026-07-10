@@ -1,0 +1,50 @@
+/* Phase 3 — changelog SQL builder tests (DB-free) */
+#include <stdio.h>
+#include <string.h>
+#include "../src/changelog.h"
+
+static int failed = 0;
+static int passed = 0;
+
+#define CHECK(expr) \
+    do { if (!(expr)) { \
+        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
+    } else { passed++; } } while(0)
+
+int main(void) {
+    printf("=== Phase 3 — changelog SQL builder tests ===\n\n");
+    char buf[2048];
+
+    printf("  T1: DDL contains DBDELTA_CHANGELOG\n");
+    changelog_ddl_sql(buf, sizeof(buf));
+    CHECK(strstr(buf, "DBDELTA_CHANGELOG") != NULL);
+    CHECK(strstr(buf, "CHANGESET") != NULL);
+    CHECK(strstr(buf, "FILENAME") != NULL);
+    CHECK(strstr(buf, "SHA256") != NULL);
+    CHECK(strstr(buf, "AUTHOR") != NULL);
+    CHECK(strstr(buf, "APPLIED_AT") != NULL);
+    CHECK(strstr(buf, "PRIMARY KEY") != NULL);
+
+    printf("  T2: EXISTS SQL queries SYSCAT.TABLES uppercase\n");
+    changelog_exists_sql(buf, sizeof(buf));
+    CHECK(strstr(buf, "SYSCAT.TABLES") != NULL);
+    CHECK(strstr(buf, "DBDELTA_CHANGELOG") != NULL);
+    CHECK(strstr(buf, "CURRENT SCHEMA") != NULL);
+
+    printf("  T3: CHECK SQL has ? placeholder\n");
+    changelog_check_sql(buf, sizeof(buf));
+    CHECK(strstr(buf, "DBDELTA_CHANGELOG") != NULL);
+    CHECK(strstr(buf, "CHANGESET") != NULL);
+    CHECK(strchr(buf, '?') != NULL);
+
+    printf("  T4: INSERT SQL has 4 ? placeholders\n");
+    changelog_insert_sql(buf, sizeof(buf));
+    CHECK(strstr(buf, "DBDELTA_CHANGELOG") != NULL);
+    CHECK(strstr(buf, "INSERT") != NULL);
+    int qmarks = 0;
+    for (const char *p = buf; *p; p++) if (*p == '?') qmarks++;
+    CHECK(qmarks == 4);
+
+    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
+    return failed ? 1 : 0;
+}

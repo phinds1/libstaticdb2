@@ -1,0 +1,40 @@
+#!/bin/bash
+#
+# Snip Test - Unit testing the way you wish you didn't have to do it
+#
+
+#
+# CD to the .in files directory
+#
+in="$1"
+basedir=$(dirname $in)
+snipfile=$(basename $in)
+
+cd "$basedir"
+
+if [ ! -f $snipfile ]
+then
+    echo "File not found: $1"
+    exit 1
+fi
+if [ ! -f ${snipfile%.*}.make ]
+then
+    echo "No make file: ${snipfile%.*}.make"
+    exit 1
+fi
+if [ ! -x ${snipfile%.*}.make ]
+then
+    echo "Make not executable: ${snipfile%.*}.make"
+    chmod +x ${snipfile%.*}.make || exit 1
+fi
+
+cat $snipfile | awk '
+/^.*$/ {
+    print $0;
+}
+/^\/\/SNIP_FILE.*/ {
+    system("snipcat " $2 " " $3);
+}
+' > ${snipfile%.*}
+
+./${snipfile%.*}.make

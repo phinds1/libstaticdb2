@@ -1,0 +1,39 @@
+/* Phase 2 — conn_open failure path (no live DB needed) */
+#include <stdio.h>
+#include <string.h>
+#include "../src/args.h"
+#include "../src/conn.h"
+
+static int failed = 0;
+static int passed = 0;
+
+#define CHECK(expr) \
+    do { if (!(expr)) { \
+        printf("  FAIL [%d]: %s\n", __LINE__, #expr); failed++; \
+    } else { passed++; } } while(0)
+
+int main(void) {
+    printf("=== Phase 2 — conn_open failure test ===\n\n");
+
+    /* Connect to an unroutable port — should fail cleanly without crash */
+    printf("  T1: conn_open to unroutable host:1 → non-zero, no crash\n");
+    db2delta_args_t args;
+    memset(&args, 0, sizeof(args));
+    strncpy(args.host, "127.0.0.1", sizeof(args.host) - 1);
+    args.port = 1;
+    strncpy(args.database, "FAKE", sizeof(args.database) - 1);
+    strncpy(args.user, "fakeuser", sizeof(args.user) - 1);
+    strncpy(args.password, "fakepwd", sizeof(args.password) - 1);
+
+    db2delta_conn_t conn;
+    int r = conn_open(&conn, &args);
+    CHECK(r != 0);  /* must fail */
+
+    /* conn_close on an already-failed open must not crash */
+    printf("  T2: conn_close after failed open → no crash\n");
+    conn_close(&conn);
+    passed++; /* reached here = no crash */
+
+    printf("\n=== Result: %d passed, %d failed ===\n", passed, failed);
+    return failed ? 1 : 0;
+}
