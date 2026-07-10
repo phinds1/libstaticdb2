@@ -7,7 +7,7 @@ SNIPRUN = ./snip/sniprun
 LIB_SRC = src/buf.c src/net.c src/ccsid.c src/dss.c src/ddm.c src/drda.c src/sqlca.c src/fdoca.c src/handles.c src/api.c src/async.c
 LIB_OBJ = $(LIB_SRC:.c=.o)
 
-.PHONY: all lib test lint clean check db2delta db2delta-test db2delta-lint
+.PHONY: all lib test lint clean check db2delta db2delta-test db2delta-lint install
 
 all: lib
 
@@ -85,4 +85,41 @@ db2delta-test: db2delta
 
 db2delta-lint: db2delta
 	$(MAKE) -C db2delta lint
+
+# ── Install ───────────────────────────────────────────────────────────────────
+# Installs libstaticdb2 (headers + .a) system-wide, then installs db2delta
+# using the native package manager (dpkg on Debian/Ubuntu, rpm on RHEL/Fedora).
+#
+# Requires root (or sudo).  Override DESTDIR for staged installs.
+#
+DESTDIR       ?=
+INSTALL_LIB   ?= $(DESTDIR)/usr/local/lib
+INSTALL_INC   ?= $(DESTDIR)/usr/local/include/staticdb2
+
+install: lib db2delta
+	@# ── libstaticdb2: headers + archive ──────────────────────────────────
+	install -d $(INSTALL_LIB) $(INSTALL_INC)
+	install -m 0644 libstaticdb2.a          $(INSTALL_LIB)/libstaticdb2.a
+	install -m 0644 include/staticdb2/sdb2.h $(INSTALL_INC)/sdb2.h
+	install -m 0644 include/staticdb2/sql.h  $(INSTALL_INC)/sql.h
+	@echo "Installed libstaticdb2.a → $(INSTALL_LIB)"
+	@echo "Installed headers       → $(INSTALL_INC)"
+	@# ── db2delta: detect package manager and install ──────────────────────
+	$(MAKE) -C db2delta package
+	@if command -v dpkg >/dev/null 2>&1; then \
+	    pkg=$$(find db2delta/packaging -maxdepth 1 -name '*.deb' | head -1); \
+	    echo "Installing $$pkg via dpkg ..."; \
+	    dpkg -i $$pkg; \
+	elif command -v rpm >/dev/null 2>&1; then \
+	    pkg=$$(find db2delta/packaging/rpmbuild/RPMS -name '*.rpm' | head -1); \
+	    echo "Installing $$pkg via rpm ..."; \
+	    rpm -Uvh $$pkg; \
+	else \
+	    echo "WARNING: no dpkg or rpm found — installing db2delta binary manually"; \
+	    install -d $(DESTDIR)/usr/local/bin; \
+	    install -m 0755 db2delta/db2delta $(DESTDIR)/usr/local/bin/db2delta; \
+	    install -d $(DESTDIR)/etc/bash_completion.d; \
+	    install -m 0644 db2delta/completions/db2delta.bash \
+	        $(DESTDIR)/etc/bash_completion.d/db2delta; \
+	fi
 
