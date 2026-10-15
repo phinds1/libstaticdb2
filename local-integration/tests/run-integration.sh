@@ -26,12 +26,17 @@ echo "=== Running integration tests against ${DB2_TEST_HOST}:${DB2_TEST_PORT}/${
 cd "${REPO_ROOT}"
 ./snip/sniprun test/p16_integration.c.snip
 RC=$?
+./snip/sniprun test/p17_lob.c.snip
+RC2=$?
+./snip/sniprun test/p18_datatypes.c.snip
+RC3=$?
 
-if [[ $RC -eq 0 ]]; then
+if [[ $RC -eq 0 && $RC2 -eq 0 && $RC3 -eq 0 ]]; then
   echo ""
   echo "✅ All integration tests passed."
 else
   echo ""
-  echo "❌ Integration tests FAILED (exit code ${RC})."
+  echo "❌ Integration tests FAILED (p16=$RC p17=$RC2 p18=$RC3)."
 fi
+RC=$(( RC + RC2 + RC3 ))
 exit $RC

@@ -85,6 +85,12 @@ int changelog_has(db2delta_conn_t *c, const char *changeset, int *out_present) {
     SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_STMT, c->hdbc, &hstmt);
     if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) return -1;
 
+    rc = SQLPrepare(hstmt, (SQLCHAR *)sql, SQL_NTS);
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        conn_print_diag(SQL_HANDLE_STMT, hstmt, "changelog_has prepare");
+        SQLFreeHandle(SQL_HANDLE_STMT, hstmt); return -1;
+    }
+
     SQLLEN cs_ind = SQL_NTS;
     rc = SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_CHAR,
                           SQL_VARCHAR, 255, 0,
@@ -94,7 +100,7 @@ int changelog_has(db2delta_conn_t *c, const char *changeset, int *out_present) {
         SQLFreeHandle(SQL_HANDLE_STMT, hstmt); return -1;
     }
 
-    rc = SQLExecDirect(hstmt, (SQLCHAR *)sql, SQL_NTS);
+    rc = SQLExecute(hstmt);
     if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
         conn_print_diag(SQL_HANDLE_STMT, hstmt, "changelog_has");
         SQLFreeHandle(SQL_HANDLE_STMT, hstmt); return -1;
@@ -122,6 +128,12 @@ int changelog_record(db2delta_conn_t *c,
 
     if (!author) author = "";
 
+    rc = SQLPrepare(hstmt, (SQLCHAR *)sql, SQL_NTS);
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        conn_print_diag(SQL_HANDLE_STMT, hstmt, "changelog_record prepare");
+        SQLFreeHandle(SQL_HANDLE_STMT, hstmt); return -1;
+    }
+
     SQLLEN cs_ind  = SQL_NTS, fn_ind = SQL_NTS;
     SQLLEN sha_ind = SQL_NTS, au_ind = SQL_NTS;
 
@@ -134,7 +146,7 @@ int changelog_record(db2delta_conn_t *c,
     SQLBindParameter(hstmt, 4, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 255, 0,
                      (SQLPOINTER)(uintptr_t)author,    0, &au_ind);
 
-    rc = SQLExecDirect(hstmt, (SQLCHAR *)sql, SQL_NTS);
+    rc = SQLExecute(hstmt);
     int result = 0;
     if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
         conn_print_diag(SQL_HANDLE_STMT, hstmt, "changelog_record");

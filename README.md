@@ -1,18 +1,14 @@
 # lib static db2
 
-This project is a statically compiled DB2 driver for use in musl-built C code.
+This project is a statically compiled ODBC 3.x DB2 driver for use in musl-built C code.
 
-The goal is to have C code that can be compiled statically inside a C-based batch
-job or nginx module.
+The goal is to have C code that can be compiled statically inside a C-based batch job or nginx module.
 
-Since nginx is one of the target deployments it supports non-blocking I/O and
-async callbacks.
+Since nginx is one of the target deployments it supports non-blocking I/O and async callbacks.
 
-Because this will be used for executing SQL and not creating database GUIs, the
-metadata features of DB2 drivers are not needed in the initial version.
+Because this will be used for executing SQL and not creating database GUIs, the metadata features of DB2 drivers are not needed in the initial version.
 
-The project allows executing SQL against a DB2 instance and iterating the returned
-result set or the single returned value and nothing else.
+The project allows executing SQL against a DB2 instance and iterating the returned result set or the single returned value and nothing else.
 
 It is based on the ODBC spec and the wire protocol is an open standard (DRDA).
 
@@ -25,6 +21,15 @@ make test         # run all snip fixture tests (no live DB2 required)
 ```
 
 ## Usage — minimal API example
+
+Driver API is essentially ODBC.
+
+What's non-standard / project-specific:
+                                                                                                                                                                                                                                                                                
+- The drda_conn_t  struct and  io_send / io_recv  vtable — that's the nginx hook, not part of ODBC
+- The `sdb2_async_configure()` function
+- The `sdb2.h` internal error codes ( SDB2_OK ,  SDB2_NEED_MORE , etc.)
+- Static linking — standard ODBC is always a dynamic driver manager
 
 ```c
 #include <stdio.h>
@@ -149,6 +154,51 @@ make test
 | DB2_TEST_USER   | db2inst1    | User for authentication         |
 | DB2_TEST_PASS   | db2inst1    | Password (USRIDPWD clear-text)  |
 | SDB2_QRYBLKSZ   | (default)   | Override query block size (bytes; e.g. 512 forces CNTQRY) |
+
+## Supported Data Types
+
+All standard DB2 scalar types are supported via the ODBC API:
+
+| DB2 Type                            | ODBC SQL type          | C type (`SQL_C_*`) |
+|-------------------------------------|------------------------|--------------------|
+| SMALLINT                            | SQL_SMALLINT           | SQL_C_SHORT        |
+| INTEGER                             | SQL_INTEGER            | SQL_C_LONG         |
+| BIGINT                              | SQL_BIGINT             | SQL_C_SBIGINT      |
+| REAL / FLOAT(n≤24)                  | SQL_REAL               | SQL_C_FLOAT        |
+| DOUBLE / FLOAT(n>24)                | SQL_DOUBLE             | SQL_C_DOUBLE       |
+| DECIMAL(p,s) / NUMERIC              | SQL_DECIMAL            | SQL_C_CHAR         |
+| CHAR(n)                             | SQL_CHAR               | SQL_C_CHAR         |
+| VARCHAR(n)                          | SQL_VARCHAR            | SQL_C_CHAR         |
+| LONG VARCHAR                        | SQL_LONGVARCHAR        | SQL_C_CHAR         |
+| BINARY(n) / CHAR FOR BIT DATA       | SQL_BINARY             | SQL_C_BINARY       |
+| VARBINARY(n) / VARCHAR FOR BIT DATA | SQL_VARBINARY          | SQL_C_BINARY       |
+| BLOB(n)                             | SQL_LONGVARBINARY      | SQL_C_BINARY       |
+| CLOB(n)                             | SQL_LONGVARCHAR        | SQL_C_CHAR         |
+| DATE                                | SQL_DATE               | SQL_C_CHAR         |
+| TIME                                | SQL_TIME               | SQL_C_CHAR         |
+| TIMESTAMP                           | SQL_TIMESTAMP          | SQL_C_CHAR         |
+
+### BLOB / CLOB limitations
+
+- **Maximum value size** — LOB data is truncated at `SDB2_VALUE_STR_MAX` bytes
+  (compile-time constant, default 65 535). Use `SQLGetData` in a loop with a
+  large buffer, or recompile with a larger constant for multi-megabyte values.
+
+- **LOBs > 32 KB (single DSS limit)** — DRDA requires large LOBs to be split
+  across multiple DSS continuation blocks. The current implementation reads the
+  first DSS segment only; LOBs larger than ~32 KB may be silently truncated.
+  For values that can span multiple DSS blocks, increase
+  `QRYBLKSZ` via the `SDB2_QRYBLKSZ` environment variable and avoid very large
+  column values in performance-sensitive batch paths.
+
+- **Parameterised INSERT of LOBs** — `SQLBindParameter` with `SQL_C_BINARY` /
+  `SQL_LONGVARBINARY` and `SQL_C_CHAR` / `SQL_LONGVARCHAR` is supported.  The
+  full buffer is sent inline in the EXCSQLIMM/OPNQRY DSS; streamed `SQL_DATA_AT_EXEC`
+  is not currently implemented.
+
+- **NULL and empty LOBs** — both are fully supported.  An empty LOB (zero bytes,
+  not NULL) returns an `SQL_C_BINARY` indicator of 0; a NULL LOB returns
+  `SQL_NULL_DATA`.
 
 ## Basing the Spec Off ODBC
 

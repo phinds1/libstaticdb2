@@ -426,6 +426,159 @@ static void test_need_more(void) {
     CHECK(fdoca_decode_col(&col, NULL, 0, &v) == SDB2_NEED_MORE);
 }
 
+/* ---- LONG VARCHAR (2-byte length prefix, same wire as VARCHAR) ---- */
+static void test_long_varchar(void) {
+    fdoca_col_t col = make_col(0x34, 200, 0, 0, 1208); /* LONG VARCHAR */
+    uint8_t data[] = { 0x00, 0x05, 'H','e','l','l','o' };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_LONG_VARCHAR);
+    CHECK(v.v.str.len == 5);
+    CHECK(memcmp(v.v.str.data, "Hello", 5) == 0);
+
+    /* empty LONG VARCHAR */
+    uint8_t empty[] = { 0x00, 0x00 };
+    CHECK(fdoca_decode_col(&col, empty, sizeof empty, &v) == SDB2_OK);
+    CHECK(v.v.str.len == 0);
+}
+
+/* ---- LONG VARCHAR FOR BIT DATA (same wire as VARBINARY) ---- */
+static void test_longvarbyte(void) {
+    fdoca_col_t col = make_col(0x2A, 100, 0, 0, 0); /* LONGVARBYTE */
+    uint8_t data[] = { 0x00, 0x03, 0xAA, 0xBB, 0xCC };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_VARBINARY);
+    CHECK(v.v.str.len == 3);
+    CHECK((uint8_t)v.v.str.data[0] == 0xAA);
+    CHECK((uint8_t)v.v.str.data[2] == 0xCC);
+}
+
+/* ---- ZDECIMAL (packed BCD, same wire as DECIMAL) ---- */
+static void test_zdecimal(void) {
+    /* ZDECIMAL(5,1) = 12.3 → precision=5, scale=1, bcd_bytes=ceil((5+1)/2)=3
+     * digits: 0 0 1 2 3 sign=C → bytes: 0x00 0x12 0x3C */
+    fdoca_col_t col = make_col(0x10, 3, 5, 1, 0); /* ZDECIMAL not nullable */
+    uint8_t data[] = { 0x00, 0x12, 0x3C };
+    sdb2_value_t v;
+    CHECK(fdoca_decode_col(&col, data, sizeof data, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_DECIMAL);
+    CHECK(strcmp(v.v.str.data, "12.3") == 0);
+}
+
+/* ---- MIX/VARMIX/LONGMIX alias types ---- */
+static void test_mix_aliases(void) {
+    sdb2_value_t v;
+
+    /* MIX → decoded as CHAR */
+    fdoca_col_t mix = make_col(0x3C, 4, 0, 0, 1208);
+    uint8_t cdata[] = { 'T','e','s','t' };
+    CHECK(fdoca_decode_col(&mix, cdata, sizeof cdata, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_CHAR);
+    CHECK(v.v.str.len == 4);
+
+    /* VARMIX → decoded as VARCHAR */
+    fdoca_col_t varmix = make_col(0x3E, 50, 0, 0, 1208);
+    uint8_t vdata[] = { 0x00, 0x02, 'H','i' };
+    CHECK(fdoca_decode_col(&varmix, vdata, sizeof vdata, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_VARCHAR);
+    CHECK(v.v.str.len == 2);
+
+    /* LONGMIX → decoded as LONG_VARCHAR */
+    fdoca_col_t longmix = make_col(0x40, 200, 0, 0, 1208);
+    uint8_t ldata[] = { 0x00, 0x03, 'D','B','2' };
+    CHECK(fdoca_decode_col(&longmix, ldata, sizeof ldata, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_LONG_VARCHAR);
+    CHECK(v.v.str.len == 3);
+}
+
+/* ---- BLOB/CLOB wire-size handling ---- */
+static void test_blob_clob_wire_size(void) {
+    fdoca_col_t blob = make_col(0xC8, 4, 0, 0, 0);
+    uint8_t empty_ind[] = { 0x00, 0x00, 0x00, 0x00 };
+    CHECK(fdoca_col_wire_size(&blob, empty_ind, sizeof empty_ind) == 4);
+
+    uint8_t ext_ind[] = { 0x80, 0x00, 0x00, 0x04, 0x00, 0x00, 0x10, 0x00 };
+    CHECK(fdoca_col_wire_size(&blob, ext_ind, sizeof ext_ind) == 8);
+
+    fdoca_col_t clob_sbcs = make_col(0xCA, 4, 0, 0, 1208);
+    CHECK(fdoca_col_wire_size(&clob_sbcs, empty_ind, sizeof empty_ind) == 4);
+    CHECK(fdoca_col_wire_size(&clob_sbcs, ext_ind, sizeof ext_ind) == 8);
+
+    uint8_t short_buf[] = { 0x80 };
+    CHECK(fdoca_col_wire_size(&blob, short_buf, sizeof short_buf) == 0);
+}
+
+/* ---- DECIMAL edge cases ---- */
+static void test_decimal_edges(void) {
+    sdb2_value_t v;
+
+    /* Sign nibble F (alternate positive sign in packed BCD) */
+    fdoca_col_t col = make_col(0x0E, 4, 7, 2, 0);
+    uint8_t sign_f[] = { 0x00, 0x12, 0x34, 0x5F }; /* 123.45 with sign=F */
+    CHECK(fdoca_decode_col(&col, sign_f, sizeof sign_f, &v) == SDB2_OK);
+    CHECK(strcmp(v.v.str.data, "123.45") == 0);
+
+    /* DECIMAL(1,0) — single digit */
+    fdoca_col_t col1 = make_col(0x0E, 1, 1, 0, 0);
+    uint8_t d1[] = { 0x7C }; /* 7 positive */
+    CHECK(fdoca_decode_col(&col1, d1, sizeof d1, &v) == SDB2_OK);
+    CHECK(strcmp(v.v.str.data, "7") == 0);
+
+    /* DECIMAL(31,6) — maximum DB2 precision */
+    fdoca_col_t col31 = make_col(0x0E, 16, 31, 6, 0);
+    /* 1234567890123456789012345.678901 → packed BCD
+     * precision=31, bytes=ceil((31+1)/2)=16
+     * We encode 1.000000 = 0x00...01000000C */
+    uint8_t big[16] = {
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x10,0x00,0x00
+    };
+    big[15] = 0x0C; /* last nibble = sign C+ */
+    CHECK(fdoca_decode_col(&col31, big, sizeof big, &v) == SDB2_OK);
+    CHECK(v.type == SDB2_C_DECIMAL);
+    CHECK(!v.is_null);
+
+    /* Negative zero: all zeros with D sign */
+    fdoca_col_t col2 = make_col(0x0E, 2, 3, 1, 0);
+    uint8_t neg_zero[] = { 0x00, 0x0D };
+    CHECK(fdoca_decode_col(&col2, neg_zero, sizeof neg_zero, &v) == SDB2_OK);
+    CHECK(strcmp(v.v.str.data, "0.0") == 0);
+}
+
+/* ---- NULLs for every type ---- */
+static void test_null_all_types(void) {
+    sdb2_value_t v;
+    uint8_t null_ind[] = { 0xFF }; /* nullable null indicator */
+
+    struct { uint8_t dt; uint16_t len; uint8_t prec; uint8_t scale; sdb2_ctype_t expect; } types[] = {
+        { 0x05, 2,  0, 0, SDB2_C_INT16     }, /* SMALLINT */
+        { 0x17, 8,  0, 0, SDB2_C_INT64     }, /* BIGINT */
+        { 0x0D, 4,  0, 0, SDB2_C_FLOAT32   }, /* FLOAT32 */
+        { 0x0B, 8,  0, 0, SDB2_C_FLOAT64   }, /* FLOAT64 */
+        { 0x0F, 4,  7, 2, SDB2_C_DECIMAL   }, /* DECIMAL */
+        { 0x11, 3,  5, 1, SDB2_C_DECIMAL   }, /* ZDECIMAL */
+        { 0x21, 10, 0, 0, SDB2_C_DATE      }, /* DATE */
+        { 0x23, 8,  0, 0, SDB2_C_TIME      }, /* TIME */
+        { 0x25, 26, 0, 0, SDB2_C_TIMESTAMP }, /* TIMESTAMP */
+        { 0x31, 10, 0, 0, SDB2_C_CHAR      }, /* CHAR */
+        { 0x35, 50, 0, 0, SDB2_C_LONG_VARCHAR }, /* LONG VARCHAR */
+        { 0x27, 8,  0, 0, SDB2_C_BINARY    }, /* BINARY */
+        { 0x29, 20, 0, 0, SDB2_C_VARBINARY }, /* VARBINARY */
+        { 0x2B, 50, 0, 0, SDB2_C_VARBINARY }, /* LONGVARBYTE */
+        { 0xBF, 1,  0, 0, SDB2_C_BOOL      }, /* BOOLEAN */
+    };
+
+    for (size_t i = 0; i < sizeof(types)/sizeof(types[0]); i++) {
+        fdoca_col_t col = make_col(types[i].dt, types[i].len,
+                                   types[i].prec, types[i].scale, 1208);
+        int rc = fdoca_decode_col(&col, null_ind, sizeof null_ind, &v);
+        CHECK(rc == SDB2_OK);
+        CHECK(v.is_null == 1);
+        CHECK(v.type == types[i].expect);
+    }
+}
+
 int main(void) {
     test_bool();
     test_smallint();
@@ -441,7 +594,14 @@ int main(void) {
     test_varchar();
     test_binary();
     test_varbinary();
+    test_long_varchar();
+    test_longvarbyte();
+    test_zdecimal();
+    test_mix_aliases();
+    test_blob_clob_wire_size();
+    test_decimal_edges();
     test_nulls();
+    test_null_all_types();
     test_wire_size();
     test_get_col();
     test_get_col_nullable();

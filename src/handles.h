@@ -75,6 +75,14 @@ struct sdb2_stmt {
     const uint8_t  *cur_row;       /* points into row_buf at current row's col data */
     size_t          cur_row_len;   /* total byte count of col data in current row */
 
+    /* LOB data from EXTDTA blocks — one entry per non-empty externalized LOB,
+     * in the order they arrive. Freed and reset at start of each CNTQRY batch. */
+    uint8_t       **lob_data;      /* malloc'd buffers */
+    size_t         *lob_sizes;     /* byte length of each buffer */
+    int             lob_count;     /* valid entries in lob_data/lob_sizes */
+    int             lob_cap;       /* allocated capacity of both arrays */
+    int             lob_row_start; /* index into lob_data for first LOB of current row */
+
     /* Diagnostics */
     char            diag_msg[STMT_DIAG_MSG_LEN];
     int             diag_sqlcode;

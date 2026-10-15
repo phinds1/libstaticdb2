@@ -85,8 +85,7 @@ int conn_server_version(db2delta_conn_t *c, char *out, size_t out_sz) {
     if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) return -1;
 
     rc = SQLExecDirect(hstmt,
-        (SQLCHAR *)"SELECT SERVICE_LEVEL FROM "
-                   "TABLE(sysproc.env_get_inst_info()) AS T",
+        (SQLCHAR *)"SELECT CURRENT SERVER FROM SYSIBM.SYSDUMMY1",
         SQL_NTS);
     if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
         conn_print_diag(SQL_HANDLE_STMT, hstmt, "version query");
@@ -94,17 +93,17 @@ int conn_server_version(db2delta_conn_t *c, char *out, size_t out_sz) {
         return -1;
     }
 
-    SQLLEN ind = 0;
-    rc = SQLBindCol(hstmt, 1, SQL_C_CHAR, out, (SQLLEN)out_sz, &ind);
-    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
-        SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-        return -1;
-    }
+    SQLSMALLINT ncols = 0;
+    SQLNumResultCols(hstmt, &ncols);
 
-    rc = SQLFetch(hstmt);
+    out[0] = '\0';
     int result = 0;
-    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
-        out[0] = '\0';
+    SQLLEN ind = 0;
+    rc = SQLFetch(hstmt);
+    if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        SQLGetData(hstmt, 1, SQL_C_CHAR, out, (SQLLEN)out_sz, &ind);
+        if (ind == SQL_NULL_DATA) out[0] = '\0';
+    } else {
         result = -1;
     }
 

@@ -101,9 +101,9 @@ int main(int argc, char **argv) {
         } else {
             engine_result_t res;
             r2 = engine_apply(&conn, &args, &res);
-            if (!args.script_mode)
-                printf("\napplied=%d skipped=%d failed=%d\n",
-                       res.applied, res.skipped, res.failed);
+            if (!args.script_mode) {
+                printf("\napplied=%d skipped=%d failed=%d\n", res.applied, res.skipped, res.failed);
+            }
             if (res.failed > 0) r2 = 1;
         }
         conn_close(&conn);

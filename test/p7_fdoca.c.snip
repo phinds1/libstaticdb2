@@ -107,7 +107,7 @@ static void test_int_and_varchar(void) {
     buf_free(&b);
 }
 
-/* ---- Test 3: All core nullable types ---- */
+/* ---- Test 3: All core nullable types in QRYDSC descriptor ---- */
 static void test_all_types(void) {
     buf_t b;
     buf_init(&b, 256);
@@ -119,15 +119,31 @@ static void test_all_types(void) {
         0x0D,  /* NFLOAT4 */
         0x0B,  /* NFLOAT8 */
         0x0F,  /* NDECIMAL — [precision=7][scale=2] = 0x0702 */
+        0x11,  /* NZDECIMAL — [precision=5][scale=1] */
         0x21,  /* NDATE */
         0x23,  /* NTIME */
         0x25,  /* NTIMESTAMP */
         0x31,  /* NCHAR */
         0x33,  /* NVARCHAR */
+        0x35,  /* NLONG VARCHAR */
+        0x27,  /* NBINARY */
         0x29,  /* NVARBYTE */
+        0x2B,  /* NLONGVARBYTE */
+        0x3D,  /* NMIX → CHAR */
+        0x3F,  /* NVARMIX → VARCHAR */
+        0x41,  /* NLONGMIX → LONG_VARCHAR */
         0xBF,  /* NBOOLEAN */
     };
-    uint16_t lens[] = { 2, 4, 8, 4, 8, (7u<<8)|2u, 10, 8, 26, 10, 100, 50, 1 };
+    uint16_t lens[] = {
+        2, 4, 8, 4, 8,
+        (7u<<8)|2u,   /* DECIMAL(7,2) */
+        (5u<<8)|1u,   /* ZDECIMAL(5,1) */
+        10, 8, 26,
+        10, 100, 200, /* CHAR, VARCHAR, LONG VARCHAR */
+        8, 50, 100,   /* BINARY, VARBYTE, LONGVARBYTE */
+        10, 100, 200, /* MIX, VARMIX, LONGMIX */
+        1,            /* BOOLEAN */
+    };
     int ncols = (int)(sizeof(types) / sizeof(types[0]));
     size_t payload_len = build_qrydsc(&b, types, lens, ncols);
     buf_flip(&b);
@@ -137,22 +153,31 @@ static void test_all_types(void) {
     CHECK(rc == SDB2_OK);
     CHECK(r.ncols == ncols);
 
-    /* spot-check a few */
-    CHECK(r.cols[0].sdb2_type == SDB2_C_INT16);      /* NSMALL */
-    CHECK(r.cols[2].sdb2_type == SDB2_C_INT64);      /* NINTEGER8 */
-    CHECK(r.cols[3].sdb2_type == SDB2_C_FLOAT32);    /* NFLOAT4 */
-    CHECK(r.cols[4].sdb2_type == SDB2_C_FLOAT64);    /* NFLOAT8 */
-    CHECK(r.cols[5].sdb2_type == SDB2_C_DECIMAL);    /* NDECIMAL */
+    CHECK(r.cols[0].sdb2_type == SDB2_C_INT16);       /* NSMALL */
+    CHECK(r.cols[1].sdb2_type == SDB2_C_INT32);       /* NINTEGER */
+    CHECK(r.cols[2].sdb2_type == SDB2_C_INT64);       /* NINTEGER8 */
+    CHECK(r.cols[3].sdb2_type == SDB2_C_FLOAT32);     /* NFLOAT4 */
+    CHECK(r.cols[4].sdb2_type == SDB2_C_FLOAT64);     /* NFLOAT8 */
+    CHECK(r.cols[5].sdb2_type == SDB2_C_DECIMAL);     /* NDECIMAL */
     CHECK(r.cols[5].precision == 7);
     CHECK(r.cols[5].scale     == 2);
-    CHECK(r.cols[5].length    == 4);                 /* packed-BCD bytes = ceil((7+1)/2) */
-    CHECK(r.cols[6].sdb2_type == SDB2_C_DATE);       /* NDATE */
-    CHECK(r.cols[7].sdb2_type == SDB2_C_TIME);       /* NTIME */
-    CHECK(r.cols[8].sdb2_type == SDB2_C_TIMESTAMP);  /* NTIMESTAMP */
-    CHECK(r.cols[9].sdb2_type == SDB2_C_CHAR);       /* NCHAR */
-    CHECK(r.cols[10].sdb2_type == SDB2_C_VARCHAR);   /* NVARCHAR */
-    CHECK(r.cols[11].sdb2_type == SDB2_C_VARBINARY); /* NVARBYTE */
-    CHECK(r.cols[12].sdb2_type == SDB2_C_BOOL);      /* NBOOLEAN */
+    CHECK(r.cols[5].length    == 4); /* packed-BCD bytes = ceil((7+1)/2) */
+    CHECK(r.cols[6].sdb2_type == SDB2_C_DECIMAL);     /* NZDECIMAL → DECIMAL */
+    CHECK(r.cols[6].precision == 5);
+    CHECK(r.cols[6].scale     == 1);
+    CHECK(r.cols[7].sdb2_type == SDB2_C_DATE);        /* NDATE */
+    CHECK(r.cols[8].sdb2_type == SDB2_C_TIME);        /* NTIME */
+    CHECK(r.cols[9].sdb2_type == SDB2_C_TIMESTAMP);   /* NTIMESTAMP */
+    CHECK(r.cols[10].sdb2_type == SDB2_C_CHAR);       /* NCHAR */
+    CHECK(r.cols[11].sdb2_type == SDB2_C_VARCHAR);    /* NVARCHAR */
+    CHECK(r.cols[12].sdb2_type == SDB2_C_LONG_VARCHAR);/* NLONG */
+    CHECK(r.cols[13].sdb2_type == SDB2_C_BINARY);     /* NBINARY */
+    CHECK(r.cols[14].sdb2_type == SDB2_C_VARBINARY);  /* NVARBYTE */
+    CHECK(r.cols[15].sdb2_type == SDB2_C_VARBINARY);  /* NLONGVARBYTE */
+    CHECK(r.cols[16].sdb2_type == SDB2_C_CHAR);       /* NMIX → CHAR */
+    CHECK(r.cols[17].sdb2_type == SDB2_C_VARCHAR);    /* NVARMIX → VARCHAR */
+    CHECK(r.cols[18].sdb2_type == SDB2_C_LONG_VARCHAR);/* NLONGMIX */
+    CHECK(r.cols[19].sdb2_type == SDB2_C_BOOL);       /* NBOOLEAN */
 
     /* all should be nullable */
     for (int i = 0; i < ncols; i++) {
@@ -205,17 +230,67 @@ static void test_with_sda_triplet(void) {
 
 /* ---- Test 5: fdoca_drda_to_sdb2 boundary cases ---- */
 static void test_type_mapping(void) {
-    CHECK(fdoca_drda_to_sdb2(0x02) == SDB2_C_INT32);   /* INTEGER not nullable */
-    CHECK(fdoca_drda_to_sdb2(0x03) == SDB2_C_INT32);   /* nullable */
-    CHECK(fdoca_drda_to_sdb2(0x30) == SDB2_C_CHAR);
+    /* Core numeric types — both nullable and non-nullable forms */
+    CHECK(fdoca_drda_to_sdb2(0x02) == SDB2_C_INT32);   /* INTEGER */
+    CHECK(fdoca_drda_to_sdb2(0x03) == SDB2_C_INT32);
+    CHECK(fdoca_drda_to_sdb2(0x04) == SDB2_C_INT16);   /* SMALLINT */
+    CHECK(fdoca_drda_to_sdb2(0x05) == SDB2_C_INT16);
+    CHECK(fdoca_drda_to_sdb2(0x16) == SDB2_C_INT64);   /* BIGINT */
+    CHECK(fdoca_drda_to_sdb2(0x17) == SDB2_C_INT64);
+    CHECK(fdoca_drda_to_sdb2(0x0A) == SDB2_C_FLOAT64); /* DOUBLE */
+    CHECK(fdoca_drda_to_sdb2(0x0B) == SDB2_C_FLOAT64);
+    CHECK(fdoca_drda_to_sdb2(0x0C) == SDB2_C_FLOAT32); /* REAL */
+    CHECK(fdoca_drda_to_sdb2(0x0D) == SDB2_C_FLOAT32);
+    CHECK(fdoca_drda_to_sdb2(0x0E) == SDB2_C_DECIMAL); /* DECIMAL */
+    CHECK(fdoca_drda_to_sdb2(0x0F) == SDB2_C_DECIMAL);
+    CHECK(fdoca_drda_to_sdb2(0x10) == SDB2_C_DECIMAL); /* ZDECIMAL */
+    CHECK(fdoca_drda_to_sdb2(0x11) == SDB2_C_DECIMAL);
+
+    /* Date/time */
+    CHECK(fdoca_drda_to_sdb2(0x20) == SDB2_C_DATE);
+    CHECK(fdoca_drda_to_sdb2(0x21) == SDB2_C_DATE);
+    CHECK(fdoca_drda_to_sdb2(0x22) == SDB2_C_TIME);
+    CHECK(fdoca_drda_to_sdb2(0x23) == SDB2_C_TIME);
+    CHECK(fdoca_drda_to_sdb2(0x24) == SDB2_C_TIMESTAMP);
+    CHECK(fdoca_drda_to_sdb2(0x25) == SDB2_C_TIMESTAMP);
+
+    /* String types */
+    CHECK(fdoca_drda_to_sdb2(0x30) == SDB2_C_CHAR);        /* CHAR */
     CHECK(fdoca_drda_to_sdb2(0x31) == SDB2_C_CHAR);
-    CHECK(fdoca_drda_to_sdb2(0xC8) == SDB2_C_BLOB);
+    CHECK(fdoca_drda_to_sdb2(0x32) == SDB2_C_VARCHAR);     /* VARCHAR */
+    CHECK(fdoca_drda_to_sdb2(0x33) == SDB2_C_VARCHAR);
+    CHECK(fdoca_drda_to_sdb2(0x34) == SDB2_C_LONG_VARCHAR);/* LONG VARCHAR */
+    CHECK(fdoca_drda_to_sdb2(0x35) == SDB2_C_LONG_VARCHAR);
+    CHECK(fdoca_drda_to_sdb2(0x3C) == SDB2_C_CHAR);        /* MIX → CHAR */
+    CHECK(fdoca_drda_to_sdb2(0x3D) == SDB2_C_CHAR);
+    CHECK(fdoca_drda_to_sdb2(0x3E) == SDB2_C_VARCHAR);     /* VARMIX → VARCHAR */
+    CHECK(fdoca_drda_to_sdb2(0x3F) == SDB2_C_VARCHAR);
+    CHECK(fdoca_drda_to_sdb2(0x40) == SDB2_C_LONG_VARCHAR);/* LONGMIX */
+    CHECK(fdoca_drda_to_sdb2(0x41) == SDB2_C_LONG_VARCHAR);
+
+    /* Binary types */
+    CHECK(fdoca_drda_to_sdb2(0x26) == SDB2_C_BINARY);      /* CHAR FOR BIT DATA */
+    CHECK(fdoca_drda_to_sdb2(0x27) == SDB2_C_BINARY);
+    CHECK(fdoca_drda_to_sdb2(0x28) == SDB2_C_VARBINARY);   /* VARCHAR FOR BIT DATA */
+    CHECK(fdoca_drda_to_sdb2(0x29) == SDB2_C_VARBINARY);
+    CHECK(fdoca_drda_to_sdb2(0x2A) == SDB2_C_VARBINARY);   /* LONG VARCHAR FOR BIT DATA */
+    CHECK(fdoca_drda_to_sdb2(0x2B) == SDB2_C_VARBINARY);
+
+    /* LOB types */
+    CHECK(fdoca_drda_to_sdb2(0xC8) == SDB2_C_BLOB);        /* BLOB */
     CHECK(fdoca_drda_to_sdb2(0xC9) == SDB2_C_BLOB);
-    CHECK(fdoca_drda_to_sdb2(0xCA) == SDB2_C_CLOB);
+    CHECK(fdoca_drda_to_sdb2(0xCA) == SDB2_C_CLOB);        /* CLOB (SBCS) */
     CHECK(fdoca_drda_to_sdb2(0xCB) == SDB2_C_CLOB);
+    CHECK(fdoca_drda_to_sdb2(0xCE) == SDB2_C_CLOB);        /* CLOB (mixed) */
+    CHECK(fdoca_drda_to_sdb2(0xCF) == SDB2_C_CLOB);
+
+    /* Boolean */
     CHECK(fdoca_drda_to_sdb2(0xBE) == SDB2_C_BOOL);
     CHECK(fdoca_drda_to_sdb2(0xBF) == SDB2_C_BOOL);
-    CHECK(fdoca_drda_to_sdb2(0xFF) == SDB2_C_UNKNOWN);  /* unknown type */
+
+    /* Unknown type */
+    CHECK(fdoca_drda_to_sdb2(0xFF) == SDB2_C_UNKNOWN);
+    CHECK(fdoca_drda_to_sdb2(0x00) == SDB2_C_UNKNOWN);
 }
 
 int main(void) {

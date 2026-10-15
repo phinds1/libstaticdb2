@@ -9,13 +9,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/../local.env"
 
 DB_EXEC() {
-  docker exec -u "${DB2_INST}" "${DB2_CONTAINER}" bash -c \
-    ". ~/.bashrc 2>/dev/null; . \$HOME/sqllib/db2profile; $1"
+  docker exec -u "${DB2_INST}" "${DB2_CONTAINER}" bash -c ". ~/.bashrc 2>/dev/null; . \$HOME/sqllib/db2profile; $1"
 }
 
 echo "=== Creating ${DB2_DB} database in ${DB2_CONTAINER} ==="
-DB_EXEC "db2 CREATE DATABASE ${DB2_DB} AUTOMATIC STORAGE YES \
-  USING CODESET UTF-8 TERRITORY US PAGESIZE 32768"
+DB_EXEC "db2 CREATE DATABASE ${DB2_DB} AUTOMATIC STORAGE YES USING CODESET UTF-8 TERRITORY US PAGESIZE 32768"
 
 echo "=== Tuning log config for local testing ==="
 DB_EXEC "db2 update db cfg for ${DB2_DB} using logfilsiz 1024 logprimary 10 logsecond 20"

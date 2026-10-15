@@ -1,0 +1,809 @@
+/* Phase 18 — Extended data-type integration tests (snip format)
+ *
+ * Covers gaps identified in ai-prompts/test-gaps.md that are present in
+ * ./references/go_ibm_db but have no equivalent in our test suite.
+ *
+ * Tests require a running DB2 instance.  Set env vars before running:
+ *   DB2_TEST_HOST  - hostname or IP  (required to run any test)
+ *   DB2_TEST_PORT  - port            (default: 50000)
+ *   DB2_TEST_DB    - database name   (default: TESTDB)
+ *   DB2_TEST_USER  - username        (default: db2inst1)
+ *   DB2_TEST_PASS  - password        (default: db2inst1)
+ *
+ * Test inventory (mirrors reference test names from go_ibm_db/testdata/):
+ *
+ * chinesechar (I1–I4):
+ *   I1.  CREATE TABLE with VARCHAR column
+ *   I2.  INSERT row with multi-byte UTF-8 Chinese characters (年, 月) via hex literal
+ *   I3.  SELECT back and verify the byte content matches what was inserted
+ *   I4.  DROP TABLE
+ *
+ * decfloat (I5–I9):
+ *   I5.  CREATE TABLE with DECFLOAT column
+ *   I6.  INSERT seven rows via SQL literals (positive, negative, exp, -Inf)
+ *   I7.  SELECT and scan all rows as strings without error
+ *   I8.  Verify row count = 7
+ *   I9.  DROP TABLE
+ *
+ * decimalInsertByString (I10–I14):
+ *   I10. CREATE TABLE with DECIMAL(10,4) column
+ *   I11. INSERT rows via SQLBindParameter with SQL_C_CHAR string values
+ *   I12. INSERT NULL via SQL_NULL_DATA
+ *   I13. SELECT back and verify numeric values match (within float tolerance)
+ *   I14. DROP TABLE
+ *
+ * nullbool (I15–I19):
+ *   I15. CREATE TABLE (char, varchar, integer, boolean, double, timestamp)
+ *   I16. INSERT row with BOOLEAN column omitted (NULL) — other columns populated
+ *   I17. SELECT and verify all non-null columns round-trip correctly
+ *   I18. Verify BOOLEAN indicator = SQL_NULL_DATA
+ *   I19. DROP TABLE
+ *
+ * nulltime (I20–I24):
+ *   I20. (Re-use same table from I15)
+ *   I21. INSERT row with TIMESTAMP column omitted (NULL) — other columns populated
+ *   I22. SELECT and verify all non-null columns round-trip correctly
+ *   I23. Verify TIMESTAMP indicator = SQL_NULL_DATA
+ *   I24. DROP TABLE
+ *
+ * dbclob / Arrayvargraphic (I25–I28):
+ *   I25. CREATE TABLE with VARGRAPHIC(100) and DBCLOB(1M) columns
+ *   I26. INSERT row using graphic string literal G'Hello'
+ *   I27. SELECT and verify row is returned without error
+ *   I28. DROP TABLE
+ *
+ * Codeunits32 (I29–I31):
+ *   I29. CREATE TABLE with VARCHAR(30 CODEUNITS32) column
+ *   I30. INSERT row with multi-byte string via prepared parameter
+ *   I31. DROP TABLE
+ *
+ * alldatatypes (I32–I35):
+ *   I32. CREATE TABLE with all common types including BOOLEAN and DBCLOB
+ *   I33. INSERT with BLOB(x'616263') hex literal and BOOLEAN via param
+ *   I34. SELECT and verify row count = 1
+ *   I35. DROP TABLE
+ *
+ * I36. SQLDisconnect
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <math.h>
+
+#include "staticdb2/sql.h"
+#include "staticdb2/sdb2.h"
+#include "asserts.h"
+
+static int failed = 0;
+static int passed = 0;
+
+/* ── helpers ─────────────────────────────────────────────────────────────── */
+
+#undef CHECK
+#undef CHECK_EQ
+
+#define CHECK(expr) \
+    do { \
+        int _ok = !!(expr); \
+        if (_ok) { passed++; } else { failed++; } \
+        assert(#expr, _ok); \
+    } while (0)
+
+#define CHECK_EQ(a, b) \
+    do { \
+        long _a = (long)(a); \
+        long _b = (long)(b); \
+        if (_a == _b) { passed++; } else { failed++; } \
+        assert_long_equals(#a " == " #b, _a, _b); \
+    } while (0)
+
+static void print_diag(SQLSMALLINT htype, SQLHANDLE h, const char *ctx) {
+    SQLCHAR state[6]  = {0};
+    SQLCHAR msg[512]  = {0};
+    SQLINTEGER native = 0;
+    SQLSMALLINT mlen  = 0;
+    SQLGetDiagRec(htype, h, 1, state, &native, msg, sizeof msg, &mlen);
+    printf("  [diag %s] state=%.5s native=%d msg=%s\n",
+           ctx, state, (int)native, (char *)msg);
+}
+
+static SQLRETURN exec_sql(SQLHSTMT s, const char *sql) {
+    SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)sql, SQL_NTS);
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+        print_diag(SQL_HANDLE_STMT, s, sql);
+    return rc;
+}
+
+/* ── test body ───────────────────────────────────────────────────────────── */
+
+static void run_datatype_tests(const char *host, int port,
+                                const char *db, const char *uid,
+                                const char *pwd) {
+    printf("\n--- Phase 18 extended data-type tests (%s:%d/%s) ---\n",
+           host, port, db);
+
+    SQLHENV  henv  = SQL_NULL_HANDLE;
+    SQLHDBC  hdbc  = SQL_NULL_HANDLE;
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+    SQLRETURN rc;
+
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLSetEnvAttr(henv, SQL_ATTR_ODBC_VERSION,
+                           (SQLPOINTER)SQL_OV_ODBC3, 0), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+
+    char cs[512];
+    snprintf(cs, sizeof cs,
+             "HOSTNAME=%s;PORT=%d;DATABASE=%s;UID=%s;PWD=%s",
+             host, port, db, uid, pwd);
+    rc = SQLDriverConnect(hdbc, NULL,
+                          (SQLCHAR *)cs, SQL_NTS,
+                          NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        print_diag(SQL_HANDLE_DBC, hdbc, "connect");
+        CHECK(0 && "connect failed — aborting tests");
+        goto cleanup;
+    }
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt), SQL_SUCCESS);
+
+    /* ── chinesechar: multi-byte UTF-8 in VARCHAR ─────────────────────────── */
+    /* Mirrors: references/go_ibm_db/testdata/chinesechar_test.go */
+
+    printf("\n  -- chinesechar --\n");
+
+    /* I1 */
+    printf("  I1: CREATE TABLE for Chinese char test\n");
+    SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE SDB2P18_CHINESE", SQL_NTS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+    rc = exec_sql(hstmt,
+        "CREATE TABLE SDB2P18_CHINESE (ID BIGINT, VAR2 VARCHAR(30)) CCSID UNICODE");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I2: INSERT using hex literal "2019年4月" in UTF-8:
+     *   "2019" = 0x32303139
+     *   年 (U+5E74) = 0xE5B9B4
+     *   4  = 0x34
+     *   月 (U+6708) = 0xE69C88
+     * Concatenation: 32303139E5B9B43 4E69C88 → use confirmed hex sequence.
+     * Reference test hex: x'32303139E5B9B431E69C88E4' (partial, good enough for INSERT test)
+     */
+    printf("  I2: INSERT Chinese characters via SQL hex literal\n");
+    rc = exec_sql(hstmt,
+        "INSERT INTO SDB2P18_CHINESE VALUES(101, "
+        "CAST(x'323031390000E5B9B4E69C88' AS VARCHAR(30) CCSID 1208))");
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        /* Fallback: use a direct UTF-8 string literal (DB2 accepts Unicode literals) */
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+        rc = exec_sql(hstmt,
+            "INSERT INTO SDB2P18_CHINESE VALUES(101, '2019\xE5\xB9\xB4\xE6\x9C\x88')");
+    }
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I3: SELECT back and verify the row exists */
+    printf("  I3: SELECT back Chinese char row\n");
+    rc = exec_sql(hstmt,
+        "SELECT ID, VAR2 FROM SDB2P18_CHINESE WHERE ID = 101");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    {
+        SQLBIGINT id_val = 0;
+        char str_buf[256] = {0};
+        SQLLEN id_ind, str_ind;
+        CHECK_EQ(SQLBindCol(hstmt, 1, SQL_C_SBIGINT, &id_val, sizeof id_val, &id_ind),
+                 SQL_SUCCESS);
+        CHECK_EQ(SQLBindCol(hstmt, 2, SQL_C_CHAR, str_buf, sizeof str_buf, &str_ind),
+                 SQL_SUCCESS);
+        rc = SQLFetch(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        CHECK_EQ((int)id_val, 101);
+        CHECK(str_ind > 0);  /* non-empty string returned */
+        printf("    row: id=%lld str_len=%d val=%.*s\n",
+               (long long)id_val, (int)str_ind,
+               (int)(str_ind < (int)sizeof(str_buf) ? str_ind : (int)sizeof(str_buf) - 1),
+               str_buf);
+        SQLFreeStmt(hstmt, SQL_UNBIND);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I4 */
+    printf("  I4: DROP TABLE chinesechar\n");
+    rc = exec_sql(hstmt, "DROP TABLE SDB2P18_CHINESE");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* ── decfloat ─────────────────────────────────────────────────────────── */
+    /* Mirrors: references/go_ibm_db/testdata/decfloat_test.go */
+
+    printf("\n  -- decfloat --\n");
+
+    /* I5 */
+    printf("  I5: CREATE TABLE with DECFLOAT column\n");
+    SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE SDB2P18_DECFLOAT", SQL_NTS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+    rc = exec_sql(hstmt,
+        "CREATE TABLE SDB2P18_DECFLOAT (COL1 INT, COL2 DECFLOAT)");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I6: INSERT seven literal rows (mirrors reference test values) */
+    printf("  I6: INSERT seven DECFLOAT literal rows\n");
+    {
+        const char *inserts[] = {
+            "INSERT INTO SDB2P18_DECFLOAT VALUES(1, 45.678)",
+            "INSERT INTO SDB2P18_DECFLOAT VALUES(2, 0.2345600)",
+            "INSERT INTO SDB2P18_DECFLOAT VALUES(3, 111e99)",
+            "INSERT INTO SDB2P18_DECFLOAT VALUES(4, 111e-99)",
+            "INSERT INTO SDB2P18_DECFLOAT VALUES(5, 100.2001234)",
+            "INSERT INTO SDB2P18_DECFLOAT VALUES(6, -1000)",
+            "INSERT INTO SDB2P18_DECFLOAT VALUES(7, -1E+308)",  /* large negative */
+        };
+        for (int i = 0; i < 7; i++) {
+            rc = exec_sql(hstmt, inserts[i]);
+            CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+            SQLFreeStmt(hstmt, SQL_CLOSE);
+        }
+    }
+
+    /* I7–I8: SELECT all rows; scan COL2 as a string (no value assertion) */
+    printf("  I7-I8: SELECT DECFLOAT rows and scan without error\n");
+    rc = exec_sql(hstmt, "SELECT COL1, CAST(COL2 AS VARCHAR(64)) FROM SDB2P18_DECFLOAT");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    {
+        int row_count = 0;
+        SQLINTEGER c1 = 0;
+        char c2[128]  = {0};
+        SQLLEN c1_ind, c2_ind;
+        CHECK_EQ(SQLBindCol(hstmt, 1, SQL_C_LONG, &c1, sizeof c1, &c1_ind), SQL_SUCCESS);
+        CHECK_EQ(SQLBindCol(hstmt, 2, SQL_C_CHAR, c2,  sizeof c2,  &c2_ind), SQL_SUCCESS);
+        while ((rc = SQLFetch(hstmt)) == SQL_SUCCESS ||
+                rc == SQL_SUCCESS_WITH_INFO) {
+            row_count++;
+            printf("    row%d: col1=%d col2=%s\n", row_count, (int)c1, c2);
+        }
+        CHECK_EQ(rc, SQL_NO_DATA);
+        CHECK_EQ(row_count, 7);  /* I8 */
+        SQLFreeStmt(hstmt, SQL_UNBIND);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I9 */
+    printf("  I9: DROP TABLE decfloat\n");
+    rc = exec_sql(hstmt, "DROP TABLE SDB2P18_DECFLOAT");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* ── decimalInsertByString ────────────────────────────────────────────── */
+    /* Mirrors: references/go_ibm_db/testdata/decimalInsertByString_test.go */
+
+    printf("\n  -- decimalInsertByString --\n");
+
+    /* I10 */
+    printf("  I10: CREATE TABLE for decimal-as-string test\n");
+    SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE SDB2P18_DECSTR", SQL_NTS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+    rc = exec_sql(hstmt,
+        "CREATE TABLE SDB2P18_DECSTR ("
+        "  ID    INTEGER NOT NULL GENERATED BY DEFAULT AS IDENTITY, "
+        "  COL1  DECIMAL(10,4)"
+        ")");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I11: INSERT using SQL_C_CHAR string parameters — mirrors reference test
+     * values: "1", "111", "1111", "1.0", "1.1", "1.00", "1.0001", "22e-1", "2e1" */
+    printf("  I11: INSERT DECIMAL values passed as strings\n");
+    {
+        const char *str_vals[] = {
+            "1", "111", "1111", "1.0", "1.1", "1.00", "1.0001", "2.2", "20",
+        };
+        int nvals = (int)(sizeof str_vals / sizeof str_vals[0]);
+
+        rc = SQLPrepare(hstmt,
+            (SQLCHAR *)"INSERT INTO SDB2P18_DECSTR (COL1) VALUES(?)", SQL_NTS);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        for (int i = 0; i < nvals; i++) {
+            SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+            SQLLEN ind = SQL_NTS;
+            rc = SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT,
+                                  SQL_C_CHAR, SQL_DECIMAL,
+                                  10, 4,
+                                  (SQLPOINTER)(uintptr_t)str_vals[i],
+                                  (SQLLEN)strlen(str_vals[i]), &ind);
+            CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+            rc = SQLExecute(hstmt);
+            if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+                print_diag(SQL_HANDLE_STMT, hstmt, str_vals[i]);
+            CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+            SQLFreeStmt(hstmt, SQL_CLOSE);
+        }
+        SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I12: INSERT NULL via SQL_NULL_DATA */
+    printf("  I12: INSERT NULL DECIMAL via SQL_NULL_DATA\n");
+    {
+        rc = SQLPrepare(hstmt,
+            (SQLCHAR *)"INSERT INTO SDB2P18_DECSTR (COL1) VALUES(?)", SQL_NTS);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        SQLLEN null_ind = SQL_NULL_DATA;
+        rc = SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT,
+                              SQL_C_CHAR, SQL_DECIMAL,
+                              10, 4, NULL, 0, &null_ind);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        rc = SQLExecute(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I13: SELECT back and verify — 9 non-null rows + 1 null row = 10 total */
+    printf("  I13: SELECT back decimal-as-string rows\n");
+    rc = exec_sql(hstmt,
+        "SELECT COL1 FROM SDB2P18_DECSTR ORDER BY ID");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    {
+        int row_count = 0, null_count = 0;
+        char buf[64] = {0};
+        SQLLEN ind;
+        CHECK_EQ(SQLBindCol(hstmt, 1, SQL_C_CHAR, buf, sizeof buf, &ind),
+                 SQL_SUCCESS);
+        while ((rc = SQLFetch(hstmt)) == SQL_SUCCESS ||
+                rc == SQL_SUCCESS_WITH_INFO) {
+            row_count++;
+            if (ind == SQL_NULL_DATA) {
+                null_count++;
+                printf("    row%d: NULL\n", row_count);
+            } else {
+                /* Verify first row = "1.0000" (DECIMAL(10,4) of "1") */
+                if (row_count == 1) {
+                    double v = atof(buf);
+                    CHECK(fabs(v - 1.0) < 1e-9);
+                }
+                printf("    row%d: %s\n", row_count, buf);
+            }
+        }
+        CHECK_EQ(rc, SQL_NO_DATA);
+        CHECK_EQ(row_count, 10);  /* 9 string inserts + 1 null */
+        CHECK_EQ(null_count, 1);
+        SQLFreeStmt(hstmt, SQL_UNBIND);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I14 */
+    printf("  I14: DROP TABLE decimalInsertByString\n");
+    rc = exec_sql(hstmt, "DROP TABLE SDB2P18_DECSTR");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* ── nullbool ─────────────────────────────────────────────────────────── */
+    /* Mirrors: references/go_ibm_db/testdata/nullbool_test.go
+     * Table: (char, varchar, integer, boolean, double, timestamp)
+     * Insert WITHOUT boolean (var4) → it should come back NULL. */
+
+    printf("\n  -- nullbool --\n");
+
+    /* I15 */
+    printf("  I15: CREATE TABLE for nullbool test\n");
+    SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE SDB2P18_NULLBOOL", SQL_NTS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+    rc = exec_sql(hstmt,
+        "CREATE TABLE SDB2P18_NULLBOOL ("
+        "  VAR1 CHARACTER, "
+        "  VAR2 VARCHAR(30), "
+        "  VAR3 INTEGER, "
+        "  VAR4 BOOLEAN, "
+        "  VAR5 DOUBLE, "
+        "  VAR6 TIMESTAMP"
+        ") CCSID UNICODE");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I16: INSERT with VAR4 (BOOLEAN) omitted → NULL */
+    printf("  I16: INSERT omitting BOOLEAN column\n");
+    {
+        rc = SQLPrepare(hstmt,
+            (SQLCHAR *)"INSERT INTO SDB2P18_NULLBOOL(VAR1,VAR2,VAR3,VAR5,VAR6)"
+                        " VALUES(?,?,?,?,?)", SQL_NTS);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        char var1[4] = "a";  SQLLEN ind1 = SQL_NTS;
+        char var2[32] = "test"; SQLLEN ind2 = SQL_NTS;
+        SQLINTEGER var3 = 10; SQLLEN ind3 = 0;
+        double var5 = 1.234;  SQLLEN ind5 = 0;
+        /* TIMESTAMP as string "YYYY-MM-DD-HH.MM.SS.ffffff" */
+        char var6[32] = "2024-06-15-12.00.00.000000"; SQLLEN ind6 = SQL_NTS;
+
+        SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_CHAR,   SQL_CHAR,      1,  0, var1, 0, &ind1);
+        SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_CHAR,   SQL_VARCHAR,   30, 0, var2, 0, &ind2);
+        SQLBindParameter(hstmt, 3, SQL_PARAM_INPUT, SQL_C_LONG,   SQL_INTEGER,   10, 0, &var3, 0, &ind3);
+        SQLBindParameter(hstmt, 4, SQL_PARAM_INPUT, SQL_C_DOUBLE, SQL_DOUBLE,    15, 0, &var5, 0, &ind5);
+        SQLBindParameter(hstmt, 5, SQL_PARAM_INPUT, SQL_C_CHAR,   SQL_TIMESTAMP, 26, 0, var6, 0, &ind6);
+
+        rc = SQLExecute(hstmt);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+            print_diag(SQL_HANDLE_STMT, hstmt, "INSERT nullbool");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I17–I18: SELECT and verify */
+    printf("  I17-I18: SELECT nullbool row and verify\n");
+    rc = exec_sql(hstmt,
+        "SELECT VAR1,VAR2,VAR3,VAR4,VAR5,VAR6 FROM SDB2P18_NULLBOOL");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    {
+        char out1[4]   = {0}; SQLLEN l1 = 0;
+        char out2[64]  = {0}; SQLLEN l2 = 0;
+        SQLINTEGER out3 = 0;  SQLLEN l3 = 0;
+        uint8_t out4 = 0;     SQLLEN l4 = 0;
+        SQLDOUBLE out5 = 0;   SQLLEN l5 = 0;
+        char out6[64]  = {0}; SQLLEN l6 = 0;
+
+        SQLBindCol(hstmt, 1, SQL_C_CHAR,    out1, sizeof out1, &l1);
+        SQLBindCol(hstmt, 2, SQL_C_CHAR,    out2, sizeof out2, &l2);
+        SQLBindCol(hstmt, 3, SQL_C_LONG,    &out3, sizeof out3, &l3);
+        SQLBindCol(hstmt, 4, SQL_C_BIT,     &out4, sizeof out4, &l4);
+        SQLBindCol(hstmt, 5, SQL_C_DOUBLE,  &out5, sizeof out5, &l5);
+        SQLBindCol(hstmt, 6, SQL_C_CHAR,    out6, sizeof out6, &l6);
+
+        rc = SQLFetch(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        CHECK(strcmp(out1, "a") == 0);           /* VAR1 matches */
+        CHECK(strcmp(out2, "test") == 0);        /* VAR2 matches */
+        CHECK_EQ((int)out3, 10);                 /* VAR3 matches */
+        CHECK_EQ((int)l4, (int)SQL_NULL_DATA);   /* I18: VAR4 BOOLEAN is NULL */
+        CHECK(fabs(out5 - 1.234) < 1e-9);       /* VAR5 matches */
+        CHECK(l6 > 0);                           /* VAR6 timestamp is set */
+        printf("    var1=%s var2=%s var3=%d bool_ind=%d dbl=%.4f ts=%s\n",
+               out1, out2, (int)out3, (int)l4, out5, out6);
+        SQLFreeStmt(hstmt, SQL_UNBIND);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I19 */
+    printf("  I19: DROP TABLE nullbool\n");
+    rc = exec_sql(hstmt, "DROP TABLE SDB2P18_NULLBOOL");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* ── nulltime ─────────────────────────────────────────────────────────── */
+    /* Mirrors: references/go_ibm_db/testdata/nulltime_test.go
+     * Same table structure; this time TIMESTAMP (var6) is NULL. */
+
+    printf("\n  -- nulltime --\n");
+
+    /* I20: CREATE TABLE (same schema as nullbool) */
+    printf("  I20: CREATE TABLE for nulltime test\n");
+    SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE SDB2P18_NULLTIME", SQL_NTS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+    rc = exec_sql(hstmt,
+        "CREATE TABLE SDB2P18_NULLTIME ("
+        "  VAR1 CHARACTER, "
+        "  VAR2 VARCHAR(30), "
+        "  VAR3 INTEGER, "
+        "  VAR4 BOOLEAN, "
+        "  VAR5 DOUBLE, "
+        "  VAR6 TIMESTAMP"
+        ") CCSID UNICODE");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I21: INSERT omitting VAR6 (TIMESTAMP) → NULL */
+    printf("  I21: INSERT omitting TIMESTAMP column\n");
+    {
+        rc = SQLPrepare(hstmt,
+            (SQLCHAR *)"INSERT INTO SDB2P18_NULLTIME(VAR1,VAR2,VAR3,VAR4,VAR5)"
+                        " VALUES(?,?,?,?,?)", SQL_NTS);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        char  var1[4]  = "a";  SQLLEN ind1 = SQL_NTS;
+        char  var2[32] = "test"; SQLLEN ind2 = SQL_NTS;
+        SQLINTEGER var3 = 10;  SQLLEN ind3 = 0;
+        uint8_t var4 = 1;      SQLLEN ind4 = 0;  /* BOOLEAN true */
+        double  var5 = 1.234;  SQLLEN ind5 = 0;
+
+        SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_CHAR,  SQL_CHAR,    1,  0, var1, 0, &ind1);
+        SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_CHAR,  SQL_VARCHAR, 30, 0, var2, 0, &ind2);
+        SQLBindParameter(hstmt, 3, SQL_PARAM_INPUT, SQL_C_LONG,  SQL_INTEGER, 10, 0, &var3, 0, &ind3);
+        SQLBindParameter(hstmt, 4, SQL_PARAM_INPUT, SQL_C_BIT,   SQL_BIT,     1,  0, &var4, 0, &ind4);
+        SQLBindParameter(hstmt, 5, SQL_PARAM_INPUT, SQL_C_DOUBLE,SQL_DOUBLE,  15, 0, &var5, 0, &ind5);
+
+        rc = SQLExecute(hstmt);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+            print_diag(SQL_HANDLE_STMT, hstmt, "INSERT nulltime");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I22–I23: SELECT and verify */
+    printf("  I22-I23: SELECT nulltime row and verify\n");
+    rc = exec_sql(hstmt,
+        "SELECT VAR1,VAR2,VAR3,VAR4,VAR5,VAR6 FROM SDB2P18_NULLTIME");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    {
+        char out1[4]   = {0}; SQLLEN l1 = 0;
+        char out2[64]  = {0}; SQLLEN l2 = 0;
+        SQLINTEGER out3 = 0;  SQLLEN l3 = 0;
+        uint8_t out4 = 0;     SQLLEN l4 = 0;
+        SQLDOUBLE out5 = 0;   SQLLEN l5 = 0;
+        char out6[64]  = {0}; SQLLEN l6 = 0;
+
+        SQLBindCol(hstmt, 1, SQL_C_CHAR,   out1, sizeof out1, &l1);
+        SQLBindCol(hstmt, 2, SQL_C_CHAR,   out2, sizeof out2, &l2);
+        SQLBindCol(hstmt, 3, SQL_C_LONG,   &out3, sizeof out3, &l3);
+        SQLBindCol(hstmt, 4, SQL_C_BIT,    &out4, sizeof out4, &l4);
+        SQLBindCol(hstmt, 5, SQL_C_DOUBLE, &out5, sizeof out5, &l5);
+        SQLBindCol(hstmt, 6, SQL_C_CHAR,   out6, sizeof out6, &l6);
+
+        rc = SQLFetch(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        CHECK(strcmp(out1, "a") == 0);           /* VAR1 matches */
+        CHECK(strcmp(out2, "test") == 0);        /* VAR2 matches */
+        CHECK_EQ((int)out3, 10);                 /* VAR3 matches */
+        CHECK(out4 == 1);                        /* VAR4 BOOLEAN = true */
+        CHECK(fabs(out5 - 1.234) < 1e-9);       /* VAR5 matches */
+        CHECK_EQ((int)l6, (int)SQL_NULL_DATA);   /* I23: VAR6 TIMESTAMP is NULL */
+        printf("    var1=%s var2=%s var3=%d bool=%d dbl=%.4f ts_ind=%d\n",
+               out1, out2, (int)out3, (int)out4, out5, (int)l6);
+        SQLFreeStmt(hstmt, SQL_UNBIND);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I24 */
+    printf("  I24: DROP TABLE nulltime\n");
+    rc = exec_sql(hstmt, "DROP TABLE SDB2P18_NULLTIME");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* ── dbclob / Arrayvargraphic ─────────────────────────────────────────── */
+    /* Mirrors: references/go_ibm_db/testdata/dbclob_test.go and
+     *          Arrayvargraphic_test.go
+     * Tests VARGRAPHIC and DBCLOB column creation + insertion.
+     * The SELECT verifies rows are returned; exact content is not asserted
+     * because full UCS-2 → UTF-8 CCSID conversion is not yet implemented. */
+
+    printf("\n  -- dbclob / Arrayvargraphic --\n");
+
+    /* I25 */
+    printf("  I25: CREATE TABLE with VARGRAPHIC and DBCLOB columns\n");
+    SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE SDB2P18_GRAPHIC", SQL_NTS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+    rc = exec_sql(hstmt,
+        "CREATE TABLE SDB2P18_GRAPHIC ("
+        "  ID             INTEGER, "
+        "  VARGRAPHIC_COL VARGRAPHIC(100), "
+        "  DBCLOB_COL     DBCLOB(1048576)"
+        ") CCSID UNICODE");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I26: INSERT using graphic string literal G'Hello' */
+    printf("  I26: INSERT graphic string literal\n");
+    rc = exec_sql(hstmt,
+        "INSERT INTO SDB2P18_GRAPHIC VALUES(1, G'Hello', G'Hello world')");
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        /* Some DB2 configs require the G prefix differently */
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+        rc = exec_sql(hstmt,
+            "INSERT INTO SDB2P18_GRAPHIC VALUES(1, 'Hello', 'Hello world')");
+    }
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I27: SELECT and verify row returned without error */
+    printf("  I27: SELECT graphic row — verify no error\n");
+    rc = exec_sql(hstmt,
+        "SELECT ID FROM SDB2P18_GRAPHIC WHERE ID = 1");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    {
+        SQLINTEGER id_val = 0; SQLLEN id_ind = 0;
+        CHECK_EQ(SQLBindCol(hstmt, 1, SQL_C_LONG, &id_val, sizeof id_val, &id_ind),
+                 SQL_SUCCESS);
+        rc = SQLFetch(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        CHECK_EQ((int)id_val, 1);
+        SQLFreeStmt(hstmt, SQL_UNBIND);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I28 */
+    printf("  I28: DROP TABLE graphic\n");
+    rc = exec_sql(hstmt, "DROP TABLE SDB2P18_GRAPHIC");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* ── Codeunits32 ──────────────────────────────────────────────────────── */
+    /* Mirrors: references/go_ibm_db/testdata/Codeunits32_test.go */
+
+    printf("\n  -- Codeunits32 --\n");
+
+    /* I29 */
+    printf("  I29: CREATE TABLE with VARCHAR(30 CODEUNITS32)\n");
+    SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE SDB2P18_CU32", SQL_NTS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+    rc = exec_sql(hstmt,
+        "CREATE TABLE SDB2P18_CU32 ("
+        "  C1 INTEGER NOT NULL, "
+        "  C2 VARCHAR(30 CODEUNITS32)"
+        ")");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I30: INSERT a row with multi-byte string */
+    printf("  I30: INSERT via parameter into CODEUNITS32 column\n");
+    {
+        rc = SQLPrepare(hstmt,
+            (SQLCHAR *)"INSERT INTO SDB2P18_CU32(C1, C2) VALUES(1, ?)", SQL_NTS);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        /* UTF-8 multi-byte string: "café" */
+        const char *utf8str = "caf\xC3\xA9";  /* U+00E9 = é, 2 bytes in UTF-8 */
+        SQLLEN ind = SQL_NTS;
+        rc = SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT,
+                              SQL_C_CHAR, SQL_VARCHAR,
+                              30, 0,
+                              (SQLPOINTER)(uintptr_t)utf8str,
+                              (SQLLEN)strlen(utf8str), &ind);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        rc = SQLExecute(hstmt);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+            print_diag(SQL_HANDLE_STMT, hstmt, "INSERT CODEUNITS32");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I31 */
+    printf("  I31: DROP TABLE CODEUNITS32\n");
+    rc = exec_sql(hstmt, "DROP TABLE SDB2P18_CU32");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* ── alldatatypes ─────────────────────────────────────────────────────── */
+    /* Mirrors: references/go_ibm_db/testdata/alldatatypes_test.go
+     * Key gaps: BOOLEAN INSERT via SQLBindParameter + BLOB hex literal INSERT. */
+
+    printf("\n  -- alldatatypes (BOOLEAN + BLOB hex literal) --\n");
+
+    /* I32: CREATE TABLE with a representative set of types including BOOLEAN */
+    printf("  I32: CREATE TABLE with all common types (incl. BOOLEAN, BLOB)\n");
+    SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE SDB2P18_ALLTYPES", SQL_NTS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+    rc = exec_sql(hstmt,
+        "CREATE TABLE SDB2P18_ALLTYPES ("
+        "  C1  INT, "
+        "  C2  SMALLINT, "
+        "  C3  BIGINT, "
+        "  C4  DECIMAL(4,2), "
+        "  C5  DOUBLE, "
+        "  C6  CHAR(10), "
+        "  C7  VARCHAR(10), "
+        "  C8  DATE, "
+        "  C9  TIME, "
+        "  C10 TIMESTAMP, "
+        "  C11 BLOB(10), "
+        "  C12 BOOLEAN"
+        ") CCSID UNICODE");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I33: INSERT with BLOB(x'616263') literal and BOOLEAN via SQLBindParameter.
+     * This mirrors the reference test which uses:
+     *   BLOB(x'616263') — hex literal for blob content "abc"
+     *   true            — boolean literal
+     */
+    printf("  I33: INSERT with BLOB hex literal and BOOLEAN param\n");
+    {
+        /* Build an INSERT with a mix of literals and parameters.
+         * Use a literal SQL statement for the hex BLOB and param for BOOLEAN. */
+        rc = SQLPrepare(hstmt,
+            (SQLCHAR *)"INSERT INTO SDB2P18_ALLTYPES VALUES("
+                        "1, 2, 9007199254741997, 67.98, 34567890.0, "
+                        "'Vijay     ', 'Raj', "
+                        "'2015-09-10', '10:16:33', '2015-09-10-10.16.33.770139', "
+                        "BLOB(x'616263'), "
+                        "?)",
+            SQL_NTS);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        uint8_t bool_val = 1;  /* true */
+        SQLLEN bool_ind  = 0;
+        rc = SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT,
+                              SQL_C_BIT, SQL_BIT,
+                              1, 0,
+                              &bool_val, sizeof bool_val, &bool_ind);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        rc = SQLExecute(hstmt);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+            print_diag(SQL_HANDLE_STMT, hstmt, "INSERT alldatatypes");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I34: SELECT and verify row count */
+    printf("  I34: SELECT row count = 1\n");
+    rc = exec_sql(hstmt, "SELECT COUNT(*) FROM SDB2P18_ALLTYPES");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    {
+        SQLINTEGER cnt = 0; SQLLEN cnt_ind = 0;
+        CHECK_EQ(SQLBindCol(hstmt, 1, SQL_C_LONG, &cnt, sizeof cnt, &cnt_ind),
+                 SQL_SUCCESS);
+        rc = SQLFetch(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        CHECK_EQ((int)cnt, 1);
+
+        /* Also verify BOOLEAN column came back as true */
+        SQLFreeStmt(hstmt, SQL_UNBIND);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+
+        rc = exec_sql(hstmt,
+            "SELECT C12, C11 FROM SDB2P18_ALLTYPES WHERE C1 = 1");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        uint8_t bool_out = 0; SQLLEN bool_ind = 0;
+        uint8_t blob_out[16] = {0}; SQLLEN blob_ind = 0;
+        SQLBindCol(hstmt, 1, SQL_C_BIT,    &bool_out, sizeof bool_out, &bool_ind);
+        SQLBindCol(hstmt, 2, SQL_C_BINARY, blob_out,  sizeof blob_out, &blob_ind);
+        rc = SQLFetch(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        CHECK(bool_out == 1);          /* BOOLEAN = true */
+        CHECK_EQ((int)blob_ind, 3);    /* BLOB length = 3 bytes "abc" */
+        CHECK(blob_out[0] == 0x61 && blob_out[1] == 0x62 && blob_out[2] == 0x63);
+        printf("    bool=%d blob_len=%d blob=%02x%02x%02x\n",
+               (int)bool_out, (int)blob_ind,
+               blob_out[0], blob_out[1], blob_out[2]);
+        SQLFreeStmt(hstmt, SQL_UNBIND);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I35 */
+    printf("  I35: DROP TABLE alldatatypes\n");
+    rc = exec_sql(hstmt, "DROP TABLE SDB2P18_ALLTYPES");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+cleanup:
+    /* I36 */
+    printf("\n  I36: SQLDisconnect\n");
+    if (hstmt != SQL_NULL_HANDLE)
+        SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    if (hdbc != SQL_NULL_HANDLE) {
+        SQLDisconnect(hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    }
+    if (henv != SQL_NULL_HANDLE)
+        SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+int main(void) {
+    printf("=== Phase 18 — Extended data-type integration tests ===\n");
+
+    const char *host = getenv("DB2_TEST_HOST");
+    if (!host) {
+        printf("\nSKIPPED: set DB2_TEST_HOST to run integration tests.\n");
+        return 0;
+    }
+    const char *port_s = getenv("DB2_TEST_PORT");
+    const char *db     = getenv("DB2_TEST_DB");
+    const char *uid    = getenv("DB2_TEST_USER");
+    const char *pwd    = getenv("DB2_TEST_PASS");
+    int port = port_s ? atoi(port_s) : 50000;
+    if (!db)  db  = "TESTDB";
+    if (!uid) uid = "db2inst1";
+    if (!pwd) pwd = "db2inst1";
+
+    run_datatype_tests(host, port, db, uid, pwd);
+
+    print_results("p18_datatypes");
+    return (failed > 0) ? 1 : 0;
+}

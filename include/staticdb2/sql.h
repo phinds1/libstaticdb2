@@ -92,6 +92,9 @@ typedef short           SQLRETURN;
 #define SQL_VARBINARY         (-3)
 #define SQL_LONGVARCHAR       (-1)
 #define SQL_LONGVARBINARY     (-4)
+/* DB2-specific extensions */
+#define SQL_BOOLEAN           (-360)  /* DB2 BOOLEAN — encode/decode as SQL_C_BIT */
+#define SQL_DECFLOAT          (-369)  /* DB2 DECFLOAT — opaque binary on wire */
 
 /* ---- Environment attributes (SQLSetEnvAttr / SQLGetEnvAttr) ---- */
 #define SQL_ATTR_ODBC_VERSION   200

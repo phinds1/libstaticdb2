@@ -956,6 +956,72 @@ static int append_qrydta(sdb2_stmt_t *stmt, buf_t *b, size_t payload_len) {
     return SDB2_OK;
 }
 
+static void stmt_lob_reset(sdb2_stmt_t *stmt) {
+    for (int i = 0; i < stmt->lob_count; i++) {
+        free(stmt->lob_data[i]);
+        stmt->lob_data[i] = NULL;
+    }
+    stmt->lob_count     = 0;
+    stmt->lob_row_start = 0;
+}
+
+static int stmt_lob_append(sdb2_stmt_t *stmt, const uint8_t *data, size_t len) {
+    if (stmt->lob_count >= stmt->lob_cap) {
+        int new_cap = stmt->lob_cap ? stmt->lob_cap * 2 : 8;
+        uint8_t **nd = (uint8_t **)realloc(stmt->lob_data, (size_t)new_cap * sizeof(uint8_t *));
+        if (!nd) return SDB2_ERR_MEM;
+        size_t *ns = (size_t *)realloc(stmt->lob_sizes, (size_t)new_cap * sizeof(size_t));
+        if (!ns) {
+            void *rolled = realloc(nd, (size_t)stmt->lob_cap * sizeof(uint8_t *));
+            stmt->lob_data = rolled ? (uint8_t **)rolled : nd;
+            return SDB2_ERR_MEM;
+        }
+        stmt->lob_data  = nd;
+        stmt->lob_sizes = ns;
+        stmt->lob_cap   = new_cap;
+    }
+    uint8_t *buf = (uint8_t *)malloc(len + 1);
+    if (!buf) return SDB2_ERR_MEM;
+    if (data && len > 0) memcpy(buf, data, len);
+    buf[len] = '\0';
+    stmt->lob_data[stmt->lob_count]  = buf;
+    stmt->lob_sizes[stmt->lob_count] = len;
+    stmt->lob_count++;
+    return SDB2_OK;
+}
+
+static int count_lobs_in_row(const fdoca_result_t *cols,
+                             const uint8_t *row, size_t row_len) {
+    int count = 0;
+    size_t offset = 0;
+    for (int i = 0; i < cols->ncols && offset < row_len; i++) {
+        const fdoca_col_t *c = &cols->cols[i];
+        int is_null = 0;
+        if (c->nullable) {
+            if (offset >= row_len) break;
+            is_null = (row[offset] & 0x80) ? 1 : 0;
+            offset++;
+        }
+        if (!is_null) {
+            if (c->sdb2_type == SDB2_C_BLOB || c->sdb2_type == SDB2_C_CLOB) {
+                if (offset + 4 > row_len) break;
+                uint32_t ind = ((uint32_t)row[offset] << 24) |
+                               ((uint32_t)row[offset + 1] << 16) |
+                               ((uint32_t)row[offset + 2] << 8) |
+                               (uint32_t)row[offset + 3];
+                uint8_t extra = (uint8_t)(ind & 0x7Fu);
+                if (ind & 0x80000000u) count++;
+                offset += 4 + extra;
+            } else {
+                size_t sz = fdoca_col_wire_size(c, row + offset, row_len - offset);
+                if (sz == 0) break;
+                offset += sz;
+            }
+        }
+    }
+    return count;
+}
+
 /* ---- Parse PRPSQLSTT / OPNQRY reply chains ---- */
 
 /*
@@ -1040,6 +1106,23 @@ static int parse_reply_chain(drda_conn_t *conn, sdb2_stmt_t *stmt,
                 rb->pos = sqldard_end;
             } else if (parse_cols && hdr.cp == CP_QRYDTA) {
                 r = append_qrydta(stmt, rb, hdr.len - 4);
+                if (r) return r;
+            } else if (hdr.cp == CP_EXTDTA && stmt) {
+                size_t ext_payload = hdr.len - 4;
+                uint8_t null_byte = 0xFF;
+                if (ext_payload > 0) {
+                    if (buf_get_u8(rb, &null_byte)) return SDB2_ERR_PROTO;
+                    ext_payload--;
+                }
+                if (null_byte == 0xFF || ext_payload == 0) {
+                    if (ext_payload > buf_remaining(rb)) return SDB2_ERR_PROTO;
+                    rb->pos += ext_payload;
+                    r = stmt_lob_append(stmt, NULL, 0);
+                } else {
+                    if (ext_payload > buf_remaining(rb)) return SDB2_ERR_PROTO;
+                    r = stmt_lob_append(stmt, rb->data + rb->pos, ext_payload);
+                    rb->pos += ext_payload;
+                }
                 if (r) return r;
             } else if (hdr.cp == CP_ENDQRYRM) {
                 if (stmt) stmt->eof = true;
@@ -1141,6 +1224,9 @@ static int send_cntqry_and_recv(sdb2_stmt_t *stmt) {
     stmt->row_buf_used = 0;
     stmt->row_pos      = 0;
     stmt->eof          = false;  /* might be set again by ENDQRYRM */
+    stmt->cur_row      = NULL;
+    stmt->cur_row_len  = 0;
+    stmt_lob_reset(stmt);
 
     r = parse_reply_chain(conn, stmt, /*parse_cols=*/0);
     if (r == SDB2_ERR_SQL) return r;
@@ -1268,6 +1354,9 @@ int drda_open_query(sdb2_stmt_t *stmt) {
     stmt->cursor_open  = false;
     stmt->row_buf_used = 0;
     stmt->row_pos      = 0;
+    stmt->cur_row      = NULL;
+    stmt->cur_row_len  = 0;
+    stmt_lob_reset(stmt);
     fdoca_result_free(&stmt->cols);
 
     /* Revert build_opnqry to simple (no params) — params handled via expansion */
@@ -1372,6 +1461,10 @@ int drda_fetch(sdb2_stmt_t *stmt, const uint8_t **out_row, size_t *out_row_len) 
 
             *out_row     = col_start;
             *out_row_len = row_bytes;
+            if (stmt->cur_row != NULL) {
+                stmt->lob_row_start +=
+                    count_lobs_in_row(&stmt->cols, stmt->cur_row, stmt->cur_row_len);
+            }
             stmt->cur_row     = col_start;
             stmt->cur_row_len = row_bytes;
             stmt->row_pos += skip + row_bytes;
@@ -1519,9 +1612,13 @@ static int build_sqldta_params(buf_t *b,
         fdoca_col_t col;
         if (param_desc && i < param_desc->ncols) {
             col = param_desc->cols[i];
+            fprintf(stderr, "[DBG] param %d: drda_type=0x%02X sdb2=%d len=%u nullable=%d\n",
+                    i, col.drda_type, col.sdb2_type, col.length, col.nullable);
         } else {
             col = fdoca_sql_type_to_col(pb->sql_type,
                                         pb->col_size, pb->dec_digits);
+            fprintf(stderr, "[DBG] param %d (fallback): sql_type=%d drda_type=0x%02X\n",
+                    i, pb->sql_type, col.drda_type);
         }
 
         long ind = pb->ind_ptr ? *pb->ind_ptr : 0L;

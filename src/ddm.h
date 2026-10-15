@@ -47,6 +47,7 @@
 #define CP_CLSQRY    0x2007u  /* Close Query */
 #define CP_SQLSTT    0x2414u  /* SQL Statement (text payload) */
 #define CP_SQLDTA    0x2412u  /* SQL Data (parameter values for EXCSQLSTT) */
+#define CP_EXTDTA    0x146Cu  /* Externalized Data */
 #define CP_QRYDSC   0x241Au  /* Query Descriptor */
 #define CP_QRYDTA   0x241Bu  /* Query Data */
 

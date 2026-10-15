@@ -42,6 +42,11 @@ void sdb2_stmt_free(sdb2_stmt_t *stmt) {
     fdoca_result_free(&stmt->param_desc);
     free(stmt->row_buf);
     stmt->row_buf = NULL;
+    for (int i = 0; i < stmt->lob_count; i++) free(stmt->lob_data[i]);
+    free(stmt->lob_data);
+    free(stmt->lob_sizes);
+    stmt->lob_data = NULL;
+    stmt->lob_sizes = NULL;
     free(stmt->bindings);
     stmt->bindings = NULL;
     free(stmt->param_bindings);

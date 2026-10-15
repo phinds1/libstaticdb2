@@ -1,0 +1,414 @@
+/* Phase 17 — BLOB/CLOB round-trip integration tests (snip format)
+ *
+ * Tests require a running DB2 instance.  Set env vars before running:
+ *   DB2_TEST_HOST  - hostname or IP  (required)
+ *   DB2_TEST_PORT  - port            (default: 50000)
+ *   DB2_TEST_DB    - database name   (default: TESTDB)
+ *   DB2_TEST_USER  - username        (default: db2inst1)
+ *   DB2_TEST_PASS  - password        (default: db2inst1)
+ *
+ * Run via local-integration/tests/run-integration.sh, or manually:
+ *   cd test && ./p17_lob.c.make
+ *
+ * Test inventory:
+ *   I1.  SQLDriverConnect → SQL_SUCCESS
+ *   I2.  CREATE TABLE with BLOB and CLOB columns
+ *   I3.  INSERT empty BLOB/CLOB (zero-length)
+ *   I4.  INSERT non-empty BLOB (binary data) and CLOB (text)
+ *   I5.  INSERT NULL BLOB and CLOB
+ *   I6.  SELECT + fetch row 1 — verify empty BLOB/CLOB
+ *   I7.  SELECT + fetch row 2 — verify binary BLOB matches; CLOB text matches
+ *   I8.  SELECT + fetch row 3 — verify NULL indicators for BLOB/CLOB
+ *   I9.  Re-INSERT large BLOB (>= 4096 bytes) and verify round-trip
+ *   I10. DROP TABLE (cleanup)
+ *   I11. SQLDisconnect
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#include "staticdb2/sql.h"
+#include "staticdb2/sdb2.h"
+#include "asserts.h"
+
+static int failed = 0;
+static int passed = 0;
+
+/* ── helpers ─────────────────────────────────────────────────────────────── */
+
+#undef CHECK
+#undef CHECK_EQ
+
+#define CHECK(expr) \
+    do { \
+        int _ok = !!(expr); \
+        if (_ok) { passed++; } else { failed++; } \
+        assert(#expr, _ok); \
+    } while (0)
+
+#define CHECK_EQ(a, b) \
+    do { \
+        long _a = (long)(a); \
+        long _b = (long)(b); \
+        if (_a == _b) { passed++; } else { failed++; } \
+        assert_long_equals(#a " == " #b, _a, _b); \
+    } while (0)
+
+static void print_diag(SQLSMALLINT htype, SQLHANDLE h, const char *ctx) {
+    SQLCHAR state[6] = {0}, msg[512] = {0};
+    SQLINTEGER native = 0;
+    SQLSMALLINT mlen  = 0;
+    SQLGetDiagRec(htype, h, 1, state, &native, msg, sizeof msg, &mlen);
+    printf("  [diag %s] state=%.5s native=%d msg=%s\n",
+           ctx, state, (int)native, (char *)msg);
+}
+
+static SQLRETURN exec(SQLHSTMT s, const char *sql) {
+    SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)sql, SQL_NTS);
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+        print_diag(SQL_HANDLE_STMT, s, sql);
+    return rc;
+}
+
+/* ── test body ───────────────────────────────────────────────────────────── */
+
+static void run_lob_tests(const char *host, int port,
+                           const char *db, const char *uid,
+                           const char *pwd) {
+    printf("\n--- BLOB/CLOB integration tests (%s:%d/%s) ---\n", host, port, db);
+
+    SQLHENV  henv  = SQL_NULL_HANDLE;
+    SQLHDBC  hdbc  = SQL_NULL_HANDLE;
+    SQLHSTMT hstmt = SQL_NULL_HANDLE;
+    SQLRETURN rc;
+
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv), SQL_SUCCESS);
+    CHECK_EQ(SQLSetEnvAttr(henv, SQL_ATTR_ODBC_VERSION,
+                           (SQLPOINTER)SQL_OV_ODBC3, 0), SQL_SUCCESS);
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc), SQL_SUCCESS);
+
+    /* I1: connect */
+    printf("\n  I1: SQLDriverConnect\n");
+    {
+        char cs[512];
+        snprintf(cs, sizeof cs,
+                 "HOSTNAME=%s;PORT=%d;DATABASE=%s;UID=%s;PASSWORD=%s",
+                 host, port, db, uid, pwd);
+        rc = SQLDriverConnect(hdbc, NULL,
+                              (SQLCHAR *)cs, SQL_NTS,
+                              NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+            print_diag(SQL_HANDLE_DBC, hdbc, "connect");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) goto cleanup;
+    }
+
+    CHECK_EQ(SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt), SQL_SUCCESS);
+
+    /* Clean up any leftover table from a previous run */
+    SQLExecDirect(hstmt, (SQLCHAR *)"DROP TABLE SDB2P17_LOB", SQL_NTS);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* I2: CREATE TABLE with BLOB(1M) and CLOB(1M) columns */
+    printf("\n  I2: CREATE TABLE with BLOB and CLOB columns\n");
+    rc = exec(hstmt,
+        "CREATE TABLE SDB2P17_LOB ("
+        "  ID      INTEGER NOT NULL, "
+        "  BDATA   BLOB(1048576), "
+        "  CDATA   CLOB(1048576)"
+        ")");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+    /* ---- INSERT helpers ---- */
+
+    /* I3: INSERT empty BLOB/CLOB (zero-length, not NULL) */
+    printf("\n  I3: INSERT empty BLOB/CLOB (id=1)\n");
+    {
+        rc = SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+        rc = SQLPrepare(hstmt,
+            (SQLCHAR *)"INSERT INTO SDB2P17_LOB VALUES (?, ?, ?)",
+            SQL_NTS);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        SQLINTEGER id = 1;
+        SQLLEN id_ind = 0;
+        CHECK_EQ(SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_LONG,
+                                   SQL_INTEGER, 10, 0,
+                                   &id, 0, &id_ind), SQL_SUCCESS);
+
+        /* Empty BLOB: zero-length binary */
+        SQLLEN blob_ind = 0;
+        CHECK_EQ(SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_BINARY,
+                                   SQL_LONGVARBINARY, 0, 0,
+                                   (SQLPOINTER)"", 0, &blob_ind), SQL_SUCCESS);
+
+        /* Empty CLOB: zero-length string */
+        SQLLEN clob_ind = 0;
+        CHECK_EQ(SQLBindParameter(hstmt, 3, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0,
+                                   (SQLPOINTER)"", 0, &clob_ind), SQL_SUCCESS);
+
+        rc = SQLExecute(hstmt);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+            print_diag(SQL_HANDLE_STMT, hstmt, "INSERT empty LOB");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+        SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+    }
+
+    /* I4: INSERT binary BLOB and text CLOB */
+    printf("\n  I4: INSERT non-empty BLOB + CLOB (id=2)\n");
+    {
+        static const uint8_t blob_data[] = {
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+        };
+        static const char clob_text[] =
+            "Hello, CLOB! This is a text LOB round-trip test.";
+
+        rc = SQLPrepare(hstmt,
+            (SQLCHAR *)"INSERT INTO SDB2P17_LOB VALUES (?, ?, ?)",
+            SQL_NTS);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        SQLINTEGER id = 2;
+        SQLLEN id_ind = 0;
+        CHECK_EQ(SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_LONG,
+                                   SQL_INTEGER, 10, 0,
+                                   &id, 0, &id_ind), SQL_SUCCESS);
+
+        SQLLEN blob_ind = (SQLLEN)sizeof(blob_data);
+        CHECK_EQ(SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_BINARY,
+                                   SQL_LONGVARBINARY, sizeof(blob_data), 0,
+                                   (SQLPOINTER)blob_data, (SQLLEN)sizeof(blob_data),
+                                   &blob_ind), SQL_SUCCESS);
+
+        SQLLEN clob_ind = (SQLLEN)strlen(clob_text);
+        CHECK_EQ(SQLBindParameter(hstmt, 3, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, strlen(clob_text), 0,
+                                   (SQLPOINTER)clob_text, (SQLLEN)strlen(clob_text),
+                                   &clob_ind), SQL_SUCCESS);
+
+        rc = SQLExecute(hstmt);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+            print_diag(SQL_HANDLE_STMT, hstmt, "INSERT LOB");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+        SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+    }
+
+    /* I5: INSERT NULL BLOB/CLOB */
+    printf("\n  I5: INSERT NULL BLOB + CLOB (id=3)\n");
+    {
+        rc = SQLPrepare(hstmt,
+            (SQLCHAR *)"INSERT INTO SDB2P17_LOB VALUES (?, ?, ?)",
+            SQL_NTS);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        SQLINTEGER id = 3;
+        SQLLEN id_ind   = 0;
+        SQLLEN null_ind = SQL_NULL_DATA;
+        CHECK_EQ(SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_LONG,
+                                   SQL_INTEGER, 10, 0,
+                                   &id, 0, &id_ind), SQL_SUCCESS);
+        CHECK_EQ(SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_BINARY,
+                                   SQL_LONGVARBINARY, 0, 0,
+                                   NULL, 0, &null_ind), SQL_SUCCESS);
+        CHECK_EQ(SQLBindParameter(hstmt, 3, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0,
+                                   NULL, 0, &null_ind), SQL_SUCCESS);
+
+        rc = SQLExecute(hstmt);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+            print_diag(SQL_HANDLE_STMT, hstmt, "INSERT NULL LOB");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+        SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+    }
+
+    /* ---- SELECT + fetch ---- */
+
+    /* I6: fetch row 1 — empty BLOB/CLOB */
+    printf("\n  I6: fetch row 1 — empty BLOB/CLOB\n");
+    {
+        rc = exec(hstmt,
+            "SELECT BDATA, CDATA FROM SDB2P17_LOB WHERE ID=1");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        rc = SQLFetch(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        uint8_t blob_buf[1024];
+        SQLLEN  blob_ind = 0;
+        rc = SQLGetData(hstmt, 1, SQL_C_BINARY, blob_buf, sizeof blob_buf, &blob_ind);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        /* empty LOB: indicator == 0 */
+        CHECK(blob_ind == 0);
+
+        char clob_buf[1024];
+        SQLLEN clob_ind = 0;
+        rc = SQLGetData(hstmt, 2, SQL_C_CHAR, clob_buf, sizeof clob_buf, &clob_ind);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        CHECK(clob_ind == 0);
+
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I7: fetch row 2 — verify binary BLOB and CLOB text */
+    printf("\n  I7: fetch row 2 — binary BLOB + CLOB text\n");
+    {
+        static const uint8_t expect_blob[] = {
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+        };
+        static const char expect_clob[] =
+            "Hello, CLOB! This is a text LOB round-trip test.";
+
+        rc = exec(hstmt,
+            "SELECT BDATA, CDATA FROM SDB2P17_LOB WHERE ID=2");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        rc = SQLFetch(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        uint8_t blob_buf[256];
+        SQLLEN  blob_ind = 0;
+        rc = SQLGetData(hstmt, 1, SQL_C_BINARY, blob_buf, sizeof blob_buf, &blob_ind);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        CHECK_EQ((int)blob_ind, (int)sizeof(expect_blob));
+        CHECK(memcmp(blob_buf, expect_blob, sizeof(expect_blob)) == 0);
+        printf("    BLOB: %d bytes match\n", (int)blob_ind);
+
+        char clob_buf[256];
+        SQLLEN clob_ind = 0;
+        rc = SQLGetData(hstmt, 2, SQL_C_CHAR, clob_buf, sizeof clob_buf, &clob_ind);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        CHECK_EQ((int)clob_ind, (int)strlen(expect_clob));
+        CHECK(strncmp(clob_buf, expect_clob, (size_t)clob_ind) == 0);
+        printf("    CLOB: '%.*s'\n", (int)clob_ind, clob_buf);
+
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I8: fetch row 3 — NULL BLOB/CLOB */
+    printf("\n  I8: fetch row 3 — NULL BLOB + CLOB\n");
+    {
+        rc = exec(hstmt,
+            "SELECT BDATA, CDATA FROM SDB2P17_LOB WHERE ID=3");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        rc = SQLFetch(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        uint8_t blob_buf[256];
+        SQLLEN  blob_ind = 0;
+        rc = SQLGetData(hstmt, 1, SQL_C_BINARY, blob_buf, sizeof blob_buf, &blob_ind);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        CHECK_EQ((int)blob_ind, (int)SQL_NULL_DATA);
+
+        char clob_buf[256];
+        SQLLEN clob_ind = 0;
+        rc = SQLGetData(hstmt, 2, SQL_C_CHAR, clob_buf, sizeof clob_buf, &clob_ind);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        CHECK_EQ((int)clob_ind, (int)SQL_NULL_DATA);
+        printf("    both indicators = SQL_NULL_DATA ✓\n");
+
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+    }
+
+    /* I9: Large BLOB round-trip (>= 4096 bytes to span multiple DSS chunks) */
+    printf("\n  I9: Large BLOB round-trip (4096 bytes)\n");
+    {
+#define LARGE_BLOB_LEN 4096
+        uint8_t large_blob[LARGE_BLOB_LEN];
+        for (int i = 0; i < LARGE_BLOB_LEN; i++)
+            large_blob[i] = (uint8_t)(i & 0xFF);
+
+        rc = SQLPrepare(hstmt,
+            (SQLCHAR *)"INSERT INTO SDB2P17_LOB VALUES (?, ?, ?)",
+            SQL_NTS);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        SQLINTEGER id = 4;
+        SQLLEN id_ind   = 0;
+        SQLLEN null_ind = SQL_NULL_DATA;
+        SQLLEN blob_ind = LARGE_BLOB_LEN;
+        CHECK_EQ(SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_LONG,
+                                   SQL_INTEGER, 10, 0,
+                                   &id, 0, &id_ind), SQL_SUCCESS);
+        CHECK_EQ(SQLBindParameter(hstmt, 2, SQL_PARAM_INPUT, SQL_C_BINARY,
+                                   SQL_LONGVARBINARY, LARGE_BLOB_LEN, 0,
+                                   large_blob, LARGE_BLOB_LEN,
+                                   &blob_ind), SQL_SUCCESS);
+        CHECK_EQ(SQLBindParameter(hstmt, 3, SQL_PARAM_INPUT, SQL_C_CHAR,
+                                   SQL_LONGVARCHAR, 0, 0,
+                                   NULL, 0, &null_ind), SQL_SUCCESS);
+
+        rc = SQLExecute(hstmt);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO)
+            print_diag(SQL_HANDLE_STMT, hstmt, "INSERT large BLOB");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+        SQLFreeStmt(hstmt, SQL_RESET_PARAMS);
+
+        /* Fetch it back and verify byte-for-byte */
+        rc = exec(hstmt,
+            "SELECT BDATA FROM SDB2P17_LOB WHERE ID=4");
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        rc = SQLFetch(hstmt);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        uint8_t read_buf[LARGE_BLOB_LEN + 64];
+        SQLLEN  read_ind = 0;
+        rc = SQLGetData(hstmt, 1, SQL_C_BINARY, read_buf, sizeof read_buf, &read_ind);
+        CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        CHECK_EQ((int)read_ind, LARGE_BLOB_LEN);
+        CHECK(memcmp(read_buf, large_blob, LARGE_BLOB_LEN) == 0);
+        printf("    Large BLOB: %d bytes match ✓\n", (int)read_ind);
+        SQLFreeStmt(hstmt, SQL_CLOSE);
+#undef LARGE_BLOB_LEN
+    }
+
+    /* I10: DROP TABLE */
+    printf("\n  I10: DROP TABLE\n");
+    rc = exec(hstmt, "DROP TABLE SDB2P17_LOB");
+    CHECK(rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    SQLFreeStmt(hstmt, SQL_CLOSE);
+
+cleanup:
+    printf("  I11: SQLDisconnect\n");
+    if (hstmt != SQL_NULL_HANDLE)
+        SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    if (hdbc != SQL_NULL_HANDLE) {
+        SQLDisconnect(hdbc);
+        SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
+    }
+    if (henv != SQL_NULL_HANDLE)
+        SQLFreeHandle(SQL_HANDLE_ENV, henv);
+}
+
+int main(void) {
+    printf("=== Phase 17 — BLOB/CLOB integration tests ===\n");
+
+    const char *host  = getenv("DB2_TEST_HOST");
+    if (!host) {
+        printf("\nSKIPPED: set DB2_TEST_HOST to run integration tests.\n");
+        return 0;
+    }
+    const char *port_s = getenv("DB2_TEST_PORT");
+    const char *db     = getenv("DB2_TEST_DB");
+    const char *uid    = getenv("DB2_TEST_USER");
+    const char *pwd    = getenv("DB2_TEST_PASS");
+    int port = port_s ? atoi(port_s) : 50000;
+    if (!db)  db  = "TESTDB";
+    if (!uid) uid = "db2inst1";
+    if (!pwd) pwd = "db2inst1";
+
+    run_lob_tests(host, port, db, uid, pwd);
+
+    print_results("p17_lob");
+    return (failed > 0) ? 1 : 0;
+}

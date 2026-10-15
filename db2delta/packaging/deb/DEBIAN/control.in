@@ -2,6 +2,7 @@ Package: db2delta
 Version: @VERSION@
 Architecture: @ARCH@
 Maintainer: Build System <build@localhost>
+Recommends: bash-completion
 Description: Zero-dependency DB2 schema migration tool
  db2delta is a statically-compiled, zero-dependency DB2 schema migration
  tool. No Java, no XML, no DB2 client libraries required. Ships as a

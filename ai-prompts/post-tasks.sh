@@ -1,16 +1,12 @@
 
-We need a test suite that covers all the DB2 data types.
+are we clean from debug logging added during testing
 
-Are ther any test cases in the references that we can borrow
+We need performance analysis, look for bottlenecks
+We need /perf-testing
+We need fuzzing
 
+Identify functional gaps and create a ./TODO.md doc
 
-Testing should be done using snip.  This way we can test actual code in the .c files  ref: Testing should be done using snip.  This way we can test actual code in the .c files
-We should copy /java/czh/dgsubs/bin scripts and the  mechanism for creating docker db2 instances to test agains and create integration tests
-the db2 isntance should be different create a dedicated test database.
+Are we fully clean on warning and cppcheck issues?
 
-we need perf testing
-
-we need fuzzing
-
-
-
+Eye candy, for db2delta, if isatty we should be colourful and while minimal make sue of utf-8 for success and failure and have a throbber if it takes a while

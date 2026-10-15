@@ -5,6 +5,7 @@ Summary:     Zero-dependency DB2 schema migration tool
 License:     MIT
 BuildArch:   x86_64
 AutoReqProv: no
+Recommends:  bash-completion
 # musl static binaries don't carry a GNU build-id section
 %global _missing_build_ids_terminate_build 0
 

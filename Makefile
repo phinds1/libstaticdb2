@@ -3,21 +3,28 @@ CFLAGS  = -std=c11 -Wall -Wextra -I include -I src -static
 AR      = ar
 ARFLAGS = rcs
 SNIPRUN = ./snip/sniprun
+TARGET  = target
 
 LIB_SRC = src/buf.c src/net.c src/ccsid.c src/dss.c src/ddm.c src/drda.c src/sqlca.c src/fdoca.c src/handles.c src/api.c src/async.c
-LIB_OBJ = $(LIB_SRC:.c=.o)
+LIB_OBJ = $(patsubst src/%.c,$(TARGET)/obj/%.o,$(LIB_SRC))
 
-.PHONY: all lib test lint clean check db2delta db2delta-test db2delta-lint install
+.PHONY: all lib test lint clean check db2delta db2delta-test db2delta-lint install deb rpm
 
 all: lib
 
-lib: libstaticdb2.a
+lib: $(TARGET)/libstaticdb2.a
 
-libstaticdb2.a: $(LIB_OBJ)
+$(TARGET)/libstaticdb2.a: $(LIB_OBJ) | $(TARGET)
 	$(AR) $(ARFLAGS) $@ $^
 
-src/%.o: src/%.c
+$(TARGET)/obj/%.o: src/%.c | $(TARGET)/obj
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(TARGET):
+	mkdir -p $(TARGET)
+
+$(TARGET)/obj: | $(TARGET)
+	mkdir -p $(TARGET)/obj
 
 # Run all phase snip tests
 test: lib
@@ -57,24 +64,10 @@ integration: lib
 	local-integration/tests/run-integration.sh
 
 clean:
-	rm -f $(LIB_OBJ) libstaticdb2.a
-	rm -f test/*.c
-	rm -f test/p1_buf test/run_p1_buf
-	rm -f test/p2_ccsid test/run_p2_ccsid
-	rm -f test/p3_dss test/run_p3_dss
-	rm -f test/p4_ddm test/run_p4_ddm
-	rm -f test/p5_drda test/run_p5_drda
-	rm -f test/p6_sqlca test/run_p6_sqlca
-	rm -f test/p7_fdoca test/run_p7_fdoca
-	rm -f test/p8_excsqlimm test/run_p8_excsqlimm
-	rm -f test/p9_query test/run_p9_query
-	rm -f test/p10_decode test/run_p10_decode
-	rm -f test/p11_odbc test/run_p11_odbc
-	rm -f test/p12_params test/run_p12_params
-	rm -f test/p13_txn test/run_p13_txn
-	rm -f test/p14_async test/run_p14_async
-	rm -f test/p15_hard test/run_p15_hard
-	rm -f test/p16_integration test/run_p16_integration
+	rm -rf $(TARGET)
+	@# Remove any sniprun test artifacts that failed mid-run
+	rm -f test/*.c test/run_p*
+	$(MAKE) -C db2delta clean
 
 # ── db2delta sub-project ──────────────────────────────────────────────────────
 db2delta: lib
@@ -99,7 +92,7 @@ INSTALL_INC   ?= $(DESTDIR)/usr/local/include/staticdb2
 install: lib db2delta
 	@# ── libstaticdb2: headers + archive ──────────────────────────────────
 	install -d $(INSTALL_LIB) $(INSTALL_INC)
-	install -m 0644 libstaticdb2.a          $(INSTALL_LIB)/libstaticdb2.a
+	install -m 0644 $(TARGET)/libstaticdb2.a $(INSTALL_LIB)/libstaticdb2.a
 	install -m 0644 include/staticdb2/sdb2.h $(INSTALL_INC)/sdb2.h
 	install -m 0644 include/staticdb2/sql.h  $(INSTALL_INC)/sql.h
 	@echo "Installed libstaticdb2.a → $(INSTALL_LIB)"
@@ -107,19 +100,37 @@ install: lib db2delta
 	@# ── db2delta: detect package manager and install ──────────────────────
 	$(MAKE) -C db2delta package
 	@if command -v dpkg >/dev/null 2>&1; then \
-	    pkg=$$(find db2delta/packaging -maxdepth 1 -name '*.deb' | head -1); \
+	    pkg=$$(find db2delta/target -maxdepth 1 -name '*.deb' | head -1); \
 	    echo "Installing $$pkg via dpkg ..."; \
 	    dpkg -i $$pkg; \
 	elif command -v rpm >/dev/null 2>&1; then \
-	    pkg=$$(find db2delta/packaging/rpmbuild/RPMS -name '*.rpm' | head -1); \
+	    pkg=$$(find db2delta/target/rpmbuild/RPMS -name '*.rpm' | head -1); \
 	    echo "Installing $$pkg via rpm ..."; \
 	    rpm -Uvh $$pkg; \
 	else \
 	    echo "WARNING: no dpkg or rpm found — installing db2delta binary manually"; \
 	    install -d $(DESTDIR)/usr/local/bin; \
-	    install -m 0755 db2delta/db2delta $(DESTDIR)/usr/local/bin/db2delta; \
+	    install -m 0755 db2delta/target/db2delta $(DESTDIR)/usr/local/bin/db2delta; \
 	    install -d $(DESTDIR)/etc/bash_completion.d; \
 	    install -m 0644 db2delta/completions/db2delta.bash \
 	        $(DESTDIR)/etc/bash_completion.d/db2delta; \
 	fi
+
+# ── deb / rpm ─────────────────────────────────────────────────────────────────
+# Build the db2delta package in one target packaging format for deployment
+# on another system (rpm → RedHat/RHEL/Fedora, deb → Debian/Ubuntu).
+# Build only — nothing is installed on the build machine.  To build and
+# install locally, use `make install`, which picks the native package manager.
+#
+deb: db2delta
+	$(MAKE) -C db2delta deb
+	@pkg=$$(find db2delta/target -maxdepth 1 -name '*.deb' | head -1); \
+	if [ -z "$$pkg" ]; then echo "ERROR: no .deb found"; exit 1; fi; \
+	echo "DEB: $$pkg"
+
+rpm: db2delta
+	$(MAKE) -C db2delta rpm
+	@pkg=$$(find db2delta/target/rpmbuild/RPMS -name '*.rpm' | head -1); \
+	if [ -z "$$pkg" ]; then echo "ERROR: no .rpm found"; exit 1; fi; \
+	echo "RPM: $$pkg"
 

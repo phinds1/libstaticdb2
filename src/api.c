@@ -84,6 +84,8 @@ static SQLSMALLINT sdb2ctype_to_sql(sdb2_ctype_t t) {
     case SDB2_C_CHAR:        return SQL_CHAR;
     case SDB2_C_VARCHAR:     return SQL_VARCHAR;
     case SDB2_C_LONG_VARCHAR: return SQL_LONGVARCHAR;
+    case SDB2_C_BLOB:        return SQL_LONGVARBINARY;
+    case SDB2_C_CLOB:        return SQL_LONGVARCHAR;
     case SDB2_C_BINARY:      return SQL_BINARY;
     case SDB2_C_VARBINARY:   return SQL_VARBINARY;
     case SDB2_C_DATE:        return SQL_DATE;
@@ -147,7 +149,9 @@ static SQLRETURN copy_value_to_c_buf(const sdb2_value_t *val,
         case SDB2_C_FLOAT32:   ct = SQL_C_FLOAT;  break;
         case SDB2_C_FLOAT64:   ct = SQL_C_DOUBLE; break;
         case SDB2_C_BINARY:
-        case SDB2_C_VARBINARY: ct = SQL_C_BINARY; break;
+        case SDB2_C_VARBINARY:
+        case SDB2_C_BLOB:      ct = SQL_C_BINARY; break;
+        case SDB2_C_CLOB:      ct = SQL_C_CHAR;   break;
         default:               ct = SQL_C_CHAR;   break;
         }
     }

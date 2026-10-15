@@ -28,10 +28,16 @@
 #define DT_MIX      0x3Cu  /* MIXED (DBCS+SB) CHAR */
 #define DT_VARMIX   0x3Eu  /* MIXED VARCHAR */
 #define DT_LONGMIX  0x40u  /* MIXED LONG VARCHAR */
+#define DT_GRAPHIC   0x36u  /* GRAPHIC (fixed-length DBCS) */
+#define DT_VARGRAPHIC 0x38u /* VARGRAPHIC (variable-length DBCS) */
+#define DT_LONGGRAPHIC 0x3Au /* LONG VARGRAPHIC */
 #define DT_LOBBYTES 0xC8u  /* BLOB */
 #define DT_LOBCSBCS 0xCAu  /* CLOB (SB character set) */
+#define DT_LOBCDBCS 0xCCu  /* DBCLOB (double-byte character LOB) */
 #define DT_LOBCMIXED 0xCEu /* CLOB (mixed character set) */
 #define DT_BOOLEAN  0xBEu  /* BOOLEAN */
+#define DT_DECFLOAT16 0x5Cu /* DECFLOAT(16) — 8-byte IEEE 754 decimal float */
+#define DT_DECFLOAT34 0x5Eu /* DECFLOAT(34) — 16-byte IEEE 754 decimal float */
 
 /*
  * FD:OCA triplet type bytes.
@@ -70,9 +76,15 @@ sdb2_ctype_t fdoca_drda_to_sdb2(uint8_t drda_type) {
     case DT_FIXBYTE:  return SDB2_C_BINARY;
     case DT_VARBYTE:  return SDB2_C_VARBINARY;
     case DT_LONGVARBYTE: return SDB2_C_VARBINARY;
+    case DT_GRAPHIC:      return SDB2_C_CHAR;       /* fixed-length DBCS → treat as CHAR */
+    case DT_VARGRAPHIC:   return SDB2_C_VARCHAR;    /* variable-length DBCS → VARCHAR */
+    case DT_LONGGRAPHIC:  return SDB2_C_LONG_VARCHAR;
     case DT_LOBBYTES: return SDB2_C_BLOB;
     case DT_LOBCSBCS:
+    case DT_LOBCDBCS:
     case DT_LOBCMIXED: return SDB2_C_CLOB;
+    case DT_DECFLOAT16:
+    case DT_DECFLOAT34:   return SDB2_C_BINARY;     /* DECFLOAT: fixed-length opaque bytes */
     default:          return SDB2_C_UNKNOWN;
     }
 }
@@ -235,6 +247,14 @@ size_t fdoca_col_wire_size(const fdoca_col_t *col,
         /* VCS length prefix is big-endian (DRDA protocol level) */
         uint16_t vlen = ((uint16_t)data[0] << 8) | (uint16_t)data[1];
         return 2u + vlen;
+    }
+    case SDB2_C_BLOB:
+    case SDB2_C_CLOB: {
+        if (avail < 4) return 0;
+        uint32_t ind = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                       ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+        uint8_t extra = (uint8_t)(ind & 0x7Fu);
+        return 4u + extra;
     }
     default:
         return col->length ? col->length : 0;
@@ -499,7 +519,69 @@ int sdb2_stmt_get_col(sdb2_stmt_t *stmt, int col_idx, sdb2_value_t *out) {
         }
     }
 
-    return fdoca_decode_col(&stmt->cols.cols[col_idx], p, avail, out);
+    const fdoca_col_t *target_col = &stmt->cols.cols[col_idx];
+
+    if (target_col->sdb2_type != SDB2_C_BLOB &&
+        target_col->sdb2_type != SDB2_C_CLOB) {
+        return fdoca_decode_col(target_col, p, avail, out);
+    }
+
+    out->type    = target_col->sdb2_type;
+    out->is_null = 0;
+
+    if (target_col->nullable) {
+        if (avail < 1) return SDB2_NEED_MORE;
+        if (p[0] & 0x80) { out->is_null = 1; return SDB2_OK; }
+        p++; avail--;
+    }
+
+    if (avail < 4) return SDB2_NEED_MORE;
+    uint32_t lob_ind = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                       ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+
+    if ((lob_ind & 0x80000000u) == 0) {
+        out->v.str.data[0] = '\0';
+        out->v.str.len = 0;
+        return SDB2_OK;
+    }
+
+    int lob_offset = 0;
+    {
+        const uint8_t *wp = stmt->cur_row;
+        size_t wa = stmt->cur_row_len;
+        for (int i = 0; i < col_idx; i++) {
+            const fdoca_col_t *wc = &stmt->cols.cols[i];
+            int wnull = 0;
+            if (wc->nullable) {
+                if (wa < 1) break;
+                wnull = (wp[0] & 0x80) ? 1 : 0;
+                wp++; wa--;
+            }
+            if (!wnull) {
+                if (wc->sdb2_type == SDB2_C_BLOB || wc->sdb2_type == SDB2_C_CLOB) {
+                    if (wa < 4) break;
+                    uint32_t wind = ((uint32_t)wp[0] << 24) | ((uint32_t)wp[1] << 16) |
+                                    ((uint32_t)wp[2] << 8) | (uint32_t)wp[3];
+                    uint8_t wextra = (uint8_t)(wind & 0x7Fu);
+                    if (wind & 0x80000000u) lob_offset++;
+                    wp += 4 + wextra; wa -= 4 + wextra;
+                } else {
+                    size_t wsz = fdoca_col_wire_size(wc, wp, wa);
+                    if (wsz == 0) break;
+                    wp += wsz; wa -= wsz;
+                }
+            }
+        }
+    }
+
+    int lob_idx = stmt->lob_row_start + lob_offset;
+    if (lob_idx >= stmt->lob_count) return SDB2_ERR_PROTO;
+
+    size_t n = stmt->lob_sizes[lob_idx];
+    if (n > SDB2_VALUE_STR_MAX) n = SDB2_VALUE_STR_MAX;
+    memcpy(out->v.str.data, stmt->lob_data[lob_idx], n);
+    out->v.str.len = (int)n;
+    return SDB2_OK;
 }
 
 /* ================================================================
@@ -558,6 +640,10 @@ fdoca_col_t fdoca_sql_type_to_col(short sql_type, unsigned int col_size, short d
         c.drda_type = DT_VARBYTE   + 1;
         c.length    = col_size ? (uint16_t)col_size : 255;
         c.sdb2_type = SDB2_C_VARBINARY; break;
+    case SQL_BIT: case SQL_BOOLEAN:
+        c.drda_type = DT_BOOLEAN   + 1; c.length = 1;  c.sdb2_type = SDB2_C_BOOL;    break;
+    case SQL_LONGVARBINARY:
+        c.drda_type = DT_LOBBYTES  + 1; c.length = 0;  c.sdb2_type = SDB2_C_BLOB;    break;
     default: /* fallback to VARCHAR */
         c.drda_type = DT_VARCHAR   + 1;
         c.length    = col_size ? (uint16_t)col_size : 255;
@@ -640,6 +726,19 @@ int fdoca_encode_col(buf_t *b, const fdoca_col_t *col,
     char tmp[128];
 
     switch (base) {
+    case DT_BOOLEAN: {
+        uint8_t v;
+        switch (c_type) {
+        case SQL_C_BIT:     v = *(const uint8_t *)value_ptr ? 1u : 0u; break;
+        case SQL_C_SHORT:   v = *(const int16_t *)value_ptr ? 1u : 0u; break;
+        case SQL_C_LONG:    v = *(const int32_t *)value_ptr ? 1u : 0u; break;
+        case SQL_C_SBIGINT: v = *(const int64_t *)value_ptr ? 1u : 0u; break;
+        case SQL_C_CHAR:    v = atoi((const char *)value_ptr) ? 1u : 0u; break;
+        default:            v = 0u; break;
+        }
+        int r = buf_ensure(b, 1); if (r) return r;
+        return buf_put_u8(b, v);
+    }
     case DT_SMALL: {
         int16_t v;
         switch (c_type) {
@@ -812,6 +911,25 @@ int fdoca_encode_col(buf_t *b, const fdoca_col_t *col,
             s = tmp;
         }
         return encode_packed_decimal(b, s, (uint8_t)col->length, col->scale);
+    }
+    case DT_LOBBYTES:
+    case DT_LOBCSBCS:
+    case DT_LOBCDBCS:
+    case DT_LOBCMIXED: {
+        /* Inline LOB parameter: 4-byte big-endian length + data */
+        uint32_t lob_len;
+        const uint8_t *lob_data;
+        if (c_type == SQL_C_CHAR) {
+            lob_len  = (uint32_t)(ind >= 0 ? ind : (long)strlen((const char *)value_ptr));
+            lob_data = (const uint8_t *)value_ptr;
+        } else {
+            lob_len  = (uint32_t)(ind >= 0 ? ind : buf_len);
+            lob_data = (const uint8_t *)value_ptr;
+        }
+        int r = buf_ensure(b, 4 + lob_len); if (r) return r;
+        buf_put_u32(b, lob_len);
+        if (lob_len > 0) buf_put_bytes(b, lob_data, lob_len);
+        return SDB2_OK;
     }
     default:
         /* Unknown: zero-fill to col->length */

@@ -69,7 +69,8 @@ clean:
 RPM_TOPDIR := $(CURDIR)/$(TARGET)/rpmbuild
 
 rpm: all
-	@mkdir -p $(RPM_TOPDIR)/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+	@mkdir -p $(RPM_TOPDIR)/BUILD $(RPM_TOPDIR)/BUILDROOT $(RPM_TOPDIR)/RPMS \
+	          $(RPM_TOPDIR)/SOURCES $(RPM_TOPDIR)/SPECS $(RPM_TOPDIR)/SRPMS
 	rpmbuild \
 	  --define "_topdir $(RPM_TOPDIR)" \
 	  --define "version $(VERSION)" \

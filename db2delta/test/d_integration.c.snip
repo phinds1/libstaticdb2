@@ -99,7 +99,7 @@ int main(void) {
     printf("\n  I4: engine_apply sample.delta (first run)\n");
     {
         args.sql_file_count = 1;
-        args.sql_files[0] = "test/fixtures/sample.delta";
+        args.sql_files[0] = "fixtures/sample.delta";
         args.mode = MODE_APPLY;
         engine_result_t result;
         memset(&result, 0, sizeof(result));
@@ -154,7 +154,7 @@ int main(void) {
         }
 
         args.sql_file_count = 1;
-        args.sql_files[0] = "test/fixtures/create_greeting_proc.delta";
+        args.sql_files[0] = "fixtures/create_greeting_proc.delta";
         args.mode = MODE_APPLY;
         engine_result_t result;
         memset(&result, 0, sizeof(result));
@@ -173,7 +173,7 @@ int main(void) {
     printf("\n  I8: engine_apply create_greeting_proc.delta (idempotent)\n");
     {
         args.sql_file_count = 1;
-        args.sql_files[0] = "test/fixtures/create_greeting_proc.delta";
+        args.sql_files[0] = "fixtures/create_greeting_proc.delta";
         args.mode = MODE_APPLY;
         engine_result_t result;
         memset(&result, 0, sizeof(result));
