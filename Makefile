@@ -10,7 +10,7 @@ LIB_OBJ = $(patsubst src/%.c,$(TARGET)/obj/%.o,$(LIB_SRC))
 
 .PHONY: all lib test lint clean check db2delta db2delta-test db2delta-lint install deb rpm
 
-all: lib
+all: lib db2delta
 
 lib: $(TARGET)/libstaticdb2.a
 
